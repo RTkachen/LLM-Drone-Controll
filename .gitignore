@@ -1,0 +1,43 @@
+# =========================
+# Katalogi budowania ROS 2 (Colcon)
+# =========================
+build/
+install/
+log/
+
+# =========================
+# Python - pliki tymczasowe i cache
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Python - pliki budowania (setuptools)
+# =========================
+*.egg-info/
+.eggs/
+dist/
+
+# =========================
+# Python - środowiska wirtualne
+# =========================
+venv/
+env/
+.venv/
+.env
+
+# =========================
+# Edytory kodu i IDE
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =========================
+# Pliki systemowe
+# =========================
+.DS_Store
+Thumbs.db
