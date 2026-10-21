@@ -12,6 +12,74 @@
       <render_engine>ogre2</render_engine>
     </plugin>
 
+    <!-- BAZOWY WEKTOR WIATRU W ŚWIECIE -->
+    <wind>
+      <!-- Stała prędkość wiatru w osiach X, Y, Z układu świata [m/s] -->
+      <linear_velocity>1.5 1.0 0.0</linear_velocity>
+    </wind>
+
+    <!-- PLUGIN STOCHASTYCZNEGO (LOSOWEGO) WIATRU NA CAŁY ŚWIAT -->
+    <plugin filename="gz-sim-wind-effects-system" name="gz::sim::systems::WindEffects">
+      <!-- Mnożnik siły oporu powietrza działającej na obiekty [- (bezjednostkowy)] -->
+      <force_approximation_scaling_factor>1.0</force_approximation_scaling_factor>
+
+      <!-- Składowa pozioma wiatru (płaszczyzna XY) -->
+      <horizontal>
+        <!-- Zmienność siły (wartości prędkości) wiatru w poziomie -->
+        <magnitude>
+          <!-- Czas narastania / wygładzania skoków prędkości (stała czasowa filtru) [s] -->
+          <time_for_rise>2.0</time_for_rise>
+          <!-- Okresowe porywy wiatru (przebieg sinusoidalny) -->
+          <sin>
+            <!-- Amplituda porywów jako ułamek prędkości bazowej [- (0.3 = 30%)] -->
+            <amplitude_percent>0.3</amplitude_percent>
+            <!-- Okres jednego pełnego cyklu porywu (wzmocnienie i osłabienie) [s] -->
+            <period>5.0</period>
+          </sin>
+          <!-- Losowe fluktuacje prędkości (szum o rozkładzie normalnym / Gaussa) -->
+          <noise type="gaussian">
+            <!-- Wartość średnia szumu prędkości [m/s] -->
+            <mean>0.0</mean>
+            <!-- Odchylenie standardowe szumu prędkości (rozrzut podmuchów) [m/s] -->
+            <stddev>1.5</stddev>
+          </noise>
+        </magnitude>
+
+        <!-- Zmienność kierunku wiatru w poziomie (obrót wokół osi Z) -->
+        <direction>
+          <!-- Czas narastania / wygładzania zmian kierunku wiatru [s] -->
+          <time_for_rise>3.0</time_for_rise>
+          <!-- Okresowe "pływanie" kierunku wiatru (sinusoida) -->
+          <sin>
+            <!-- Maksymalne wychylenie kąta od kierunku bazowego [stopnie (°)] -->
+            <amplitude>15.0</amplitude>
+            <!-- Okres pełnego cyklu zmiany kierunku [s] -->
+            <period>10.0</period>
+          </sin>
+          <!-- Losowe zawirowania kierunku wiatru (szum Gaussa) -->
+          <noise type="gaussian">
+            <!-- Średnie odchylenie kątowe [stopnie (°)] -->
+            <mean>0.0</mean>
+            <!-- Odchylenie standardowe kąta kierunku wiatru [stopnie (°)] -->
+            <stddev>10.0</stddev>
+          </noise>
+        </direction>
+      </horizontal>
+
+      <!-- Składowa pionowa wiatru (oś Z - prądy wstępujące i zstępujące) -->
+      <vertical>
+        <!-- Czas narastania pionowych podmuchów [s] -->
+        <time_for_rise>2.0</time_for_rise>
+        <!-- Losowe turbulencje pionowe (szum Gaussa) -->
+        <noise type="gaussian">
+          <!-- Średnia prędkość pionowa szumu [m/s] -->
+          <mean>0.0</mean>
+          <!-- Odchylenie standardowe prędkości pionowej (siła podbijania/dociskania) [m/s] -->
+          <stddev>0.8</stddev>
+        </noise>
+      </vertical>
+    </plugin>
+
     <light type="directional" name="sun">
       <cast_shadows>true</cast_shadows>
       <pose>0 0 10 0 0 0</pose>
@@ -32,10 +100,12 @@
       </link>
     </model>
 
+    <!-- LOKALNY MODEL DRONA Z PACZKI -->
     <include>
-      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/X3 UAV/4</uri>
+      <uri>model://x3_uav</uri>
+      <name>X3</name>
+      <pose>0 0 0.1 0 0 0</pose>
 
-      <!-- SILNIK 0 -->
       <plugin filename="gz-sim-multicopter-motor-model-system" name="gz::sim::systems::MulticopterMotorModel">
         <robotNamespace>X3</robotNamespace>
         <jointName>X3/rotor_0_joint</jointName>
@@ -54,7 +124,6 @@
         <rotorVelocitySlowdownSim>10</rotorVelocitySlowdownSim>
         <motorType>velocity</motorType>
       </plugin>
-      <!-- SILNIK 1 -->
       <plugin filename="gz-sim-multicopter-motor-model-system" name="gz::sim::systems::MulticopterMotorModel">
         <robotNamespace>X3</robotNamespace>
         <jointName>X3/rotor_1_joint</jointName>
@@ -73,7 +142,6 @@
         <rotorVelocitySlowdownSim>10</rotorVelocitySlowdownSim>
         <motorType>velocity</motorType>
       </plugin>
-      <!-- SILNIK 2 -->
       <plugin filename="gz-sim-multicopter-motor-model-system" name="gz::sim::systems::MulticopterMotorModel">
         <robotNamespace>X3</robotNamespace>
         <jointName>X3/rotor_2_joint</jointName>
@@ -92,7 +160,6 @@
         <rotorVelocitySlowdownSim>10</rotorVelocitySlowdownSim>
         <motorType>velocity</motorType>
       </plugin>
-      <!-- SILNIK 3 -->
       <plugin filename="gz-sim-multicopter-motor-model-system" name="gz::sim::systems::MulticopterMotorModel">
         <robotNamespace>X3</robotNamespace>
         <jointName>X3/rotor_3_joint</jointName>
@@ -112,13 +179,11 @@
         <motorType>velocity</motorType>
       </plugin>
 
-      <!-- NOWA, NAPRAWIONA ODOMETRIA -->
       <plugin filename="gz-sim-odometry-publisher-system" name="gz::sim::systems::OdometryPublisher">
         <dimensions>3</dimensions>
         <odom_topic>/model/X3/odometry</odom_topic>
         <odom_publish_frequency>50</odom_publish_frequency>
       </plugin>
-
     </include>
   </world>
 </sdf>
