@@ -47,7 +47,6 @@ setup(
     entry_points={
         'console_scripts': [
             # 'nazwa_wykonywalna = nazwa_folderu.nazwa_pliku_bez_py:funkcja_startowa'
-            'kontroler = moj_dron.kontroler:main',
             'motor_disturbance = moj_dron.motor_disturbance:main',
         ],
     },
