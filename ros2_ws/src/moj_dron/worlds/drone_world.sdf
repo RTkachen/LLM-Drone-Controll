@@ -14,14 +14,14 @@
 
     <!-- BAZOWY WEKTOR WIATRU W ŚWIECIE -->
     <wind>
-      <!-- Stała prędkość wiatru w osiach X, Y, Z układu świata [m/s] -->
-      <linear_velocity>1.5 1.0 0.0</linear_velocity>
+      <!-- Stała prędkość wiatru w osiach X, Y, Z układu świata [m/s] 1.5 1.0 0.0-->
+      <linear_velocity>0.0 0.0 0.0</linear_velocity>
     </wind>
 
     <!-- PLUGIN STOCHASTYCZNEGO (LOSOWEGO) WIATRU NA CAŁY ŚWIAT -->
     <plugin filename="gz-sim-wind-effects-system" name="gz::sim::systems::WindEffects">
-      <!-- Mnożnik siły oporu powietrza działającej na obiekty [- (bezjednostkowy)] -->
-      <force_approximation_scaling_factor>1.0</force_approximation_scaling_factor>
+      <!-- Mnożnik siły oporu powietrza działającej na obiekty [- (bezjednostkowy)] 1.0-->
+      <force_approximation_scaling_factor>0.0</force_approximation_scaling_factor>
 
       <!-- Składowa pozioma wiatru (płaszczyzna XY) -->
       <horizontal>

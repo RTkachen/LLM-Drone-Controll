@@ -25,7 +25,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'regulator_pid = dron_sterowanie.regulator_pid:main',
+            'regulator = dron_sterowanie.regulator:main',
         ],
     },
 )

@@ -11,7 +11,7 @@ class MotorDisturbanceNode(Node):
 
         # Parametry z notatek opiekuna
         self.alpha = 0.2          # Współczynnik filtru dolnoprzepustowego [- (od 0.0 do 1.0)] (wygładzanie i inercja)
-        self.base_stddev = 10.0   # Bazowe odchylenie standardowe szumu Gaussa [rad/s]
+        self.base_stddev = 30.0   # Bazowe odchylenie standardowe szumu Gaussa [rad/s]
         self.max_speed = 800.0    # Fizyczny limit prędkości kątowej silników X3 w Gazebo [rad/s]
 
         # Listy przechowujące prędkości [rad/s] dla 4 silników: [rotor_0, rotor_1, rotor_2, rotor_3]
