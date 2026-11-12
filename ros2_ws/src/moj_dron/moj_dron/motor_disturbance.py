@@ -1,25 +1,30 @@
 import random
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 from actuator_msgs.msg import Actuators
 
 
 class MotorDisturbanceNode(Node):
     def __init__(self):
-        # Inicjalizacja węzła ROS2 pod nazwą 'motor_disturbance_node'
         super().__init__('motor_disturbance_node')
 
-        # Parametry z notatek opiekuna
-        self.alpha = 0.2          # Współczynnik filtru dolnoprzepustowego [- (od 0.0 do 1.0)] (wygładzanie i inercja)
-        self.base_stddev = 30.0   # Bazowe odchylenie standardowe szumu Gaussa [rad/s]
-        self.max_speed = 800.0    # Fizyczny limit prędkości kątowej silników X3 w Gazebo [rad/s]
+        # 1. Deklaracja parametrów w ROS 2
+        self.declare_parameter('alpha', 0.2)          # Współczynnik filtru LPF [-] (0.0 - 1.0)
+        self.declare_parameter('base_stddev', 30.0)   # Bazowe odchylenie standardowe szumu Gaussa [rad/s]
+        self.declare_parameter('max_speed', 800.0)    # Fizyczny limit prędkości silników [rad/s]
 
-        # Listy przechowujące prędkości [rad/s] dla 4 silników: [rotor_0, rotor_1, rotor_2, rotor_3]
-        self.target_speeds = [0.0, 0.0, 0.0, 0.0]    # Prędkości zadane przez sterownik
-        self.filtered_speeds = [0.0, 0.0, 0.0, 0.0]  # Prędkości po nałożeniu szumu i filtracji
+        # 2. Wczytanie wartości początkowych do szybkich zmiennych lokalnych obiektu
+        self.alpha = self.get_parameter('alpha').value
+        self.base_stddev = self.get_parameter('base_stddev').value
+        self.max_speed = self.get_parameter('max_speed').value
 
-        # Subskrypcja czystego sygnału sterującego (z przyszłego regulatora PID)
-        # Kolejka (qos_profile) ustawiona na 10 wiadomości
+        # 3. Rejestracja callbacku dla dynamicznej zmiany parametrów (zamiast pollingu)
+        self.add_on_set_parameters_callback(self.parameters_callback)
+
+        self.target_speeds = [0.0, 0.0, 0.0, 0.0]
+        self.filtered_speeds = [0.0, 0.0, 0.0, 0.0]
+
         self.sub = self.create_subscription(
             Actuators,
             '/X3/command/motor_speed',
@@ -27,19 +32,42 @@ class MotorDisturbanceNode(Node):
             10
         )
 
-        # Publikacja zaszumionego i przefiltrowanego sygnału do Gazebo
         self.pub = self.create_publisher(
             Actuators,
             '/X3/gazebo/command/motor_speed',
             10
         )
 
-        # Pętla główna wywoływana z częstotliwością 100 Hz (okres T = 0.01 [s])
         self.timer = self.create_timer(0.01, self.update_motors)
-        self.get_logger().info('Węzeł zaburzeń silników (Gauss + LPF) uruchomiony!')
+        self.get_logger().info(
+            f'Węzeł zaburzeń uruchomiony (alpha={self.alpha}, base_stddev={self.base_stddev} rad/s).'
+        )
+
+    def parameters_callback(self, params):
+        """Callback wywoływany zdarzeniowo tylko w momencie zmiany parametru."""
+        for param in params:
+            if param.name == 'alpha':
+                if not (0.0 <= param.value <= 1.0):
+                    self.get_logger().warn('Odrzucono parametr alpha (musi być w przedziale 0.0 - 1.0)!')
+                    return SetParametersResult(successful=False, reason='alpha out of range [0, 1]')
+                self.alpha = float(param.value)
+                self.get_logger().info(f'Zaktualizowano alpha = {self.alpha}')
+
+            elif param.name == 'base_stddev':
+                if param.value < 0.0:
+                    return SetParametersResult(successful=False, reason='base_stddev must be >= 0')
+                self.base_stddev = float(param.value)
+                self.get_logger().info(f'Zaktualizowano base_stddev = {self.base_stddev} rad/s')
+
+            elif param.name == 'max_speed':
+                if param.value <= 0.0:
+                    return SetParametersResult(successful=False, reason='max_speed must be > 0')
+                self.max_speed = float(param.value)
+                self.get_logger().info(f'Zaktualizowano max_speed = {self.max_speed} rad/s')
+
+        return SetParametersResult(successful=True)
 
     def cmd_callback(self, msg: Actuators):
-        # Pobranie pierwszych 4 wartości prędkości kątowych [rad/s] z odebranej wiadomości
         if len(msg.velocity) >= 4:
             self.target_speeds = list(msg.velocity[:4])
 
@@ -48,52 +76,33 @@ class MotorDisturbanceNode(Node):
         out_velocities = []
 
         for i in range(4):
-            u = self.target_speeds[i]  # Aktualna prędkość zadana dla i-tego silnika [rad/s]
+            u = self.target_speeds[i]
 
-            # Strefa nieczułości (deadband): poniżej 1.0 [rad/s] silnik uznajemy za wyłączony,
-            # aby stojący dron nie kręcił losowo śmigłami od samego szumu.
             if u <= 1.0:
                 noisy_u = 0.0
             else:
-                # Wzór na liniowe skalowanie odchylenia standardowego szumu (sigma) w funkcji obrotów:
-                # sigma(u) = sigma_bazowe * (0.5 + 0.5 * (u / u_max)) [rad/s]
-                # Dla u -> 0 szum wynosi 50% wartości bazowej (5 rad/s).
-                # Dla u = 800 (max) szum osiąga 100% wartości bazowej (10 rad/s).
                 sigma = self.base_stddev * (0.5 + 0.5 * (u / self.max_speed))
-
-                # Losowanie zaburzenia z rozkładu normalnego (Gaussa) o średniej 0.0 [rad/s] i odchyleniu 'sigma' [rad/s]
                 noise = random.gauss(0.0, sigma)
-
-                # Nałożenie wylosowanego szumu na sygnał zadany: x[k] = u[k] + n[k] [rad/s]
                 noisy_u = u + noise
 
-            # Dyskretny filtr dolnoprzepustowy I rzędu (LPF - Low-Pass Filter / wykładnicza średnia krocząca EMA):
-            # Wzór: y[k] = alpha * x[k] + (1 - alpha) * y[k-1] [rad/s]
-            # Gdzie:
-            #   y[k]   - nowa przefiltrowana prędkość w kroku k
-            #   x[k]   - obecna zaszumiona prędkość (noisy_u)
-            #   y[k-1] - poprzednia przefiltrowana prędkość z kroku k-1
-            #   alpha  - waga nowej próbki (0.2 oznacza 20% nowego sygnału i 80% historii, co symuluje bezwładność wirnika)
+            # Filtr dolnoprzepustowy I rzędu: y[k] = alpha * x[k] + (1 - alpha) * y[k-1]
             self.filtered_speeds[i] = (
                 self.alpha * noisy_u + (1.0 - self.alpha) * self.filtered_speeds[i]
             )
 
-            # Nasycenie (clamping / saturacja) sygnału do fizycznych granic silnika: [0.0, 800.0] [rad/s]
-            # Wzór: val = min(u_max, max(0.0, y[k]))
             val = max(0.0, min(self.max_speed, self.filtered_speeds[i]))
             out_velocities.append(float(val))
 
-        # Przypisanie obliczonych prędkości do wiadomości i wysłanie do Gazebo
         out_msg.velocity = out_velocities
         self.pub.publish(out_msg)
 
 
 def main(args=None):
-    rclpy.init(args=args)               # Inicjalizacja komunikacji ROS2
-    node = MotorDisturbanceNode()       # Utworzenie obiektu węzła (wywołuje __init__)
-    rclpy.spin(node)                    # Nieskończona pętla utrzymująca węzeł przy życiu (obsługa timera i subskrypcji)
-    node.destroy_node()                 # Sprzątanie zasobów węzła po zamknięciu (np. po Ctrl+C)
-    rclpy.shutdown()                    # Zamknięcie kontekstu ROS2
+    rclpy.init(args=args)
+    node = MotorDisturbanceNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == '__main__':

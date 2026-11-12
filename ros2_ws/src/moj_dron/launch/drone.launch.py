@@ -43,11 +43,14 @@ def generate_launch_description():
         output='screen' # Wypisywanie logów mostka bezpośrednio w terminalu
     )
 
+    sciezka_config = os.path.join(pkg_share, 'config', 'disturbance_params.yaml')
+
     # 5. Uruchomienie naszego węzła zakłócającego pracę silników (z pliku motor_disturbance.py)
     motor_disturbance = Node(
         package='moj_dron',                 # Nazwa naszej paczki
         executable='motor_disturbance',     # Nazwa punktu wejścia zdefiniowana w setup.py
         name='motor_disturbance_node',      # Nazwa węzła widoczna w systemie ROS2
+        parameters=[sciezka_config],
         output='screen'
     )
 

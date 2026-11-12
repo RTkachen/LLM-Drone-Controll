@@ -29,6 +29,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         # Kopiowanie wszystkich plików świata (*.sdf) z folderu worlds/
         (os.path.join('share', package_name, 'worlds'), glob('worlds/*.sdf')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ] + model_files, # Doklejenie wcześniej wygenerowanej listy plików modelu drona
 
     package_data={'': ['py.typed']},

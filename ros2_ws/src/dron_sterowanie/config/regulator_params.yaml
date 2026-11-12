@@ -1,0 +1,30 @@
+regulator_node:
+  ros__parameters:
+    # Przełączniki modułów sterowania
+    use_rp_pid: true
+    use_yaw_pid: true
+    use_z_pid: true
+
+    # Ciąg bazowy zawisu [rad/s]
+    base_throttle: 660.4
+
+    # Zadane komendy ruchu (na starcie 0.0 = czekaj na ziemi / utrzymuj poziom)
+    target_roll: 0.0       # Przechył lewo (-)/prawo (+) [rad]
+    target_pitch: 0.0      # Pochylenie przód (+)/tył (-) [rad]
+    target_yaw_rate: 0.0   # Prędkość obrotu wokół osi Z [rad/s]
+    target_vz: 0.0         # Prędkość wznoszenia (+)/opadania (-) [m/s] (0.0 = utrzymuj obecną wysokość)
+
+    # Nastawy PID orientacji poziomej (Roll i Pitch)
+    kp_rp: 110.0
+    ki_rp: 5.0
+    kd_rp: 28.0
+
+    # Nastawy PID prędkości kątowej obrotu (Yaw Rate)
+    kp_yaw: 180.0
+    ki_yaw: 0.0
+    kd_yaw: 5.0
+
+    # Nastawy PID utrzymania wysokości (Oś Z)
+    kp_z: 75.0
+    ki_z: 8.0
+    kd_z: 65.0

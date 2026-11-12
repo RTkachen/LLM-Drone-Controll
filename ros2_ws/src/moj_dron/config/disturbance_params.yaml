@@ -1,0 +1,5 @@
+motor_disturbance_node:
+  ros__parameters:
+    alpha: 0.2          # Współczynnik filtru dolnoprzepustowego LPF (0.0 - 1.0)
+    base_stddev: 30.0   # Odchylenie standardowe szumu Gaussa silników [rad/s]
+    max_speed: 800.0    # Maksymalna prędkość obrotowa silników [rad/s]
