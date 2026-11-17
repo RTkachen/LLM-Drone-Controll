@@ -11,7 +11,7 @@ OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 
 # Adres serwera HTTP na laptopie z ROS 2 (czyli uruchomionego węzła most_ai.py).
 # UWAGA: Musisz podmienić '192.168.1.X' na rzeczywisty adres IP Twojego laptopa w sieci Wi-Fi.
-LAPTOP_URL = "http://192.168.1.X:5000"
+LAPTOP_URL = "http://192.168.1.56:5000"
 
 # Nazwa używanego modelu (musi być wcześniej pobrany komendą 'ollama pull qwen3:8b')
 MODEL_NAME = "qwen3:8b"
@@ -44,7 +44,7 @@ MODEL_OPTIONS = {
     #   0.2 - 0.4 = odpowiedzi bardzo rzeczowe, techniczne, ale z niewielką elastycznością przy szukaniu nastaw PID.
     #   0.8+ = wysoka kreatywność, większe ryzyko zmyślania (halucynacji) wzorów.
     # - Performance: Brak wpływu na zużycie VRAM i prędkość generowania.
-    "temperature": 0.35,
+    "temperature": 0.15,
 
     # top_p (Nucleus Sampling): Próg skumulowanego prawdopodobieństwa (od 0.0 do 1.0).
     # - Działanie: Model bierze pod uwagę tylko te słowa, których suma prawdopodobieństw wynosi top_p (np. 0.9 = 90%).
@@ -103,132 +103,110 @@ JSON_SCHEMA = {
 # 3. KONTEKST SYSTEMOWY DRONA X3 (WPISANY NA SZTYWNO + ZAPIS DO PLIKU JSON)
 # ==============================================================================
 
-DEFAULT_SYSTEM_PROMPT = """Jesteś inteligentnym systemem sterowania dronem kwadrotorem X3.
-Użytkownik wyda Ci komendę w języku polskim (np. "poleć do przodu", "wznieś się na chwilę", "zawiśnij").
-Twoim jedynym zadaniem jest przetłumaczenie tej intencji na parametry lotu i zwrócenie ich w wymaganym formacie JSON.
+# Nowy, kuloodporny prompt - abstrakcyjny, oparty na intencjach
+DEFAULT_SYSTEM_PROMPT = """Jesteś asystentem sterowania dronem X3. Tłumaczysz intencje na surowy format JSON. Użytkownik używa dowolnego szyku (np. "do przodu i w lewo").
 
-ZASADY MAPOWANIA RUCHU:
-- target_roll: przechył boczny w radianach [-0.3, 0.3]. Ujemny = w lewo, Dodatni = w prawo.
-- target_pitch: pochylenie wzdłużne w radianach [-0.3, 0.3]. Dodatni = w przód, Ujemny = w tył.
-- target_vz: prędkość pionowa w m/s [-1.0, 1.0]. Dodatni = leć w górę, Ujemny = leć w dół.
-- target_yaw_rate: prędkość obracania się wokół własnej osi [rad/s].
-- duration_sec: czas w sekundach, przez jaki ten manewr ma trwać. Jeśli użytkownik nie podał czasu, ustaw domyślnie 2.0 sekundy.
-- odpowiedz_dla_uzytkownika: krótki, naturalny komunikat po polsku potwierdzający zrozumienie komendy.
+WARTOŚCI BAZOWE (Dla aktywnej osi ruchu):
+1. Zwykła prędkość: 0.15 (dla Vz 0.5)
+2. Powoli / delikatnie: 0.05 (dla Vz 0.2)
+3. Szybko / najszybciej: 0.3 (dla Vz 1.0)
 
-Komenda "zatrzymaj się", "zawiśnij" lub "stój" oznacza ustawienie target_roll, target_pitch, target_vz oraz target_yaw_rate na 0.0 przy czasie duration_sec na 0.0."""
+KIERUNKI:
+- W lewo -> target_roll (Ujemny)
+- W prawo -> target_roll (Dodatni)
+- Do przodu -> target_pitch (Dodatni)
+- Do tyłu -> target_pitch (Ujemny)
+- W górę / do góry -> target_vz (Dodatni)
+- W dół / do dołu -> target_vz (Ujemny)
 
+BARDZO WAŻNE REGUŁY:
+1. NIEWYMIENIONE w komendzie osie ruchu ZAWSZE ustawiaj na 0.0.
+2. Czas (duration_sec): Jeśli nie podano w komendzie, ZAWSZE ustawiaj na 2.0.
+3. Przy skosach (np. "do przodu w lewo powoli") ustaw oba wymienione parametry na zadaną wartość.
+4. "Zatrzymaj się / zawiśnij": Wszystkie targety = 0.0, czas = 0.0.
+5. odpowiedz_dla_uzytkownika: Jedno zdanie po polsku."""
 
 def load_or_create_system_prompt(filepath: str) -> str:
-    """Wczytuje kontekst drona z pliku JSON na dysku lub tworzy nowy przy pierwszym starcie."""
     if os.path.exists(filepath):
         with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
-    else:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump({"system_prompt": DEFAULT_SYSTEM_PROMPT}, f, ensure_ascii=False, indent=2)
-        return DEFAULT_SYSTEM_PROMPT
+            return json.load(f).get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump({"system_prompt": DEFAULT_SYSTEM_PROMPT}, f, ensure_ascii=False, indent=2)
+    return DEFAULT_SYSTEM_PROMPT
 
+def clean_json_response(raw_text: str) -> dict:
+    text = raw_text.strip()
+    if text.startswith("```json"): text = text[7:]
+    if text.startswith("```"): text = text[3:]
+    if text.endswith("```"): text = text[:-3]
+    return json.loads(text.strip())
+
+def estimate_true_history_tokens(chat_history: list) -> int:
+    total_chars = sum(len(msg["content"]) for msg in chat_history)
+    return int(total_chars / 3.2)
 
 def send_message_to_llm(chat_history: list) -> dict:
-    """
-    Wysyła całą historię rozmowy do serwera Ollama.
-    Dzięki opcji "format": JSON_SCHEMA wymusza na modelu wygenerowanie poprawnego słownika JSON.
-    """
     payload = {
         "model": MODEL_NAME,
         "messages": chat_history,
         "stream": False,
         "options": MODEL_OPTIONS,
         "keep_alive": KEEP_ALIVE,
-        "format": JSON_SCHEMA  # Wymuszenie czystego JSON-a, brak zbędnego tekstu na wyjściu
+        "format": JSON_SCHEMA 
     }
-
-    # timeout=60 pozwala na dłuższą pracę modelu (szczególnie przy pierwszym ładowaniu do VRAM)
     response = requests.post(OLLAMA_URL, json=payload, timeout=60)
     response.raise_for_status()
-    
-    # Wyciągnięcie wygenerowanego tekstu (który jest poprawnym JSON-em) i konwersja na słownik Pythona
-    response_text = response.json()["message"]["content"]
-    return json.loads(response_text), response.json()
-
+    return clean_json_response(response.json()["message"]["content"]), response.json()
 
 def send_command_to_laptop(command_json: dict):
-    """
-    Przesyła gotowy słownik parametrów (wygenerowany przez LLM) do serwera HTTP na laptopie.
-    Węzeł most_ai.py na laptopie odbierze ten pakiet i przełoży go na komendy dla silników ROS 2.
-    """
     try:
-        # timeout=2 zabezpiecza przed zawieszeniem czatu w przypadku utraty połączenia Wi-Fi z laptopem
-        res = requests.post(LAPTOP_URL, json=command_json, timeout=2)
-        res.raise_for_status()
-        print("[SIEĆ] Pomyślnie wysłano komendę do drona (ROS 2).")
+        requests.post(LAPTOP_URL, json=command_json, timeout=2).raise_for_status()
+        print(" -> [ROS 2]: OK.")
     except requests.exceptions.RequestException as e:
-        print(f"\n[SIEĆ - BŁĄD] Nie udało się połączyć z laptopem pod adresem {LAPTOP_URL}: {e}")
-        print("Upewnij się, że węzeł 'most_ai' działa na laptopie i adres IP jest wpisany poprawnie.")
-
+        print(f" -> [ROS 2 BŁĄD]: {e}")
 
 def main():
     system_prompt = load_or_create_system_prompt(CONTEXT_FILE)
-    
-    # Pamięć konwersacji: przechowuje kontekst (prompt systemowy) oraz historię poleceń
     chat_history = [{"role": "system", "content": system_prompt}]
 
-    print("=" * 75)
-    print(f" Most AI (Windows) -> ROS 2 (Laptop) Gotowy | Model: {MODEL_NAME}")
-    print(" Wydawaj polecenia (np. 'Poleć w lewo na 3 sekundy', 'Zatrzymaj się')")
-    print("=" * 75)
+    print(f"--- AI DRONE CHAT ({MODEL_NAME}) GOTOWY ---")
 
     while True:
         try:
-            user_input = input("\nKomenda lotu: ").strip()
+            user_input = input("\nKomenda: ").strip()
         except (KeyboardInterrupt, EOFError):
-            print("\nZamykanie czatu...")
             break
 
-        if not user_input:
-            continue
-        if user_input.lower() in ["/wyjdz", "exit", "quit"]:
-            break
+        if not user_input: continue
+        if user_input.lower() in ["/wyjdz", "exit", "quit"]: break
         if user_input.lower() == "/reset":
-            # Wyczyszczenie historii przy zachowaniu promptu systemowego
             chat_history = [{"role": "system", "content": system_prompt}]
-            print("[INFO] Pamięć konwersacji wyczyszczona.")
+            print(" -> [INFO]: Pamięć wyczyszczona.")
             continue
 
-        # 1. Zapis intencji użytkownika do pamięci modelu
         chat_history.append({"role": "user", "content": user_input})
 
         try:
-            # 2. Przekazanie zapytania do AI i odbiór sformatowanej odpowiedzi (JSON)
             command_json, diag_data = send_message_to_llm(chat_history)
-            
-            # 3. Zapis odpowiedzi AI do historii rozmowy. 
-            # Wymagany jest zapis tekstowy JSON-a (ensure_ascii=False zapewnia poprawne polskie znaki).
             chat_history.append({"role": "assistant", "content": json.dumps(command_json, ensure_ascii=False)})
 
-            # 4. Wyświetlenie informacji zwrotnej w czytelny sposób dla operatora
-            print(f"\nAI: {command_json.get('odpowiedz_dla_uzytkownika', 'Rozumiem.')}")
-            print(f"Parametry: Roll={command_json.get('target_roll')}, Pitch={command_json.get('target_pitch')}, "
-                  f"Vz={command_json.get('target_vz')}, Czas={command_json.get('duration_sec')}s")
-
-            # 5. Fizyczne przesłanie sterowania przez sieć LAN do laptopa (ROS 2)
+            print(f"AI: {command_json.get('odpowiedz_dla_uzytkownika')}")
+            print(f" -> [PARAM]: R={command_json.get('target_roll')} P={command_json.get('target_pitch')} Vz={command_json.get('target_vz')} t={command_json.get('duration_sec')}s")
+            
             send_command_to_laptop(command_json)
 
-            # 6. Opcjonalna diagnostyka wydajności (szybkość pracy GPU)
-            eval_tokens = diag_data.get("eval_count", 0)
-            eval_duration_ns = diag_data.get("eval_duration", 1)
-            tokens_per_sec = eval_tokens / (eval_duration_ns / 1e9)
-            print(f"(Diagnostyka AI: Generowanie {tokens_per_sec:.1f} tok/s)")
+            tokens_per_sec = diag_data.get("eval_count", 0) / (diag_data.get("eval_duration", 1) / 1e9)
+            true_tok = estimate_true_history_tokens(chat_history)
+            ctx_pct = (true_tok / MODEL_OPTIONS["num_ctx"]) * 100
+            
+            print(f" -> [DIAG]: {len(chat_history)} wiadomości | Pamięć: ~{true_tok}/{MODEL_OPTIONS['num_ctx']} ({ctx_pct:.1f}%) | Prędkość: {tokens_per_sec:.1f} tok/s")
 
         except json.JSONDecodeError:
-            print("\n[BŁĄD]: Model nie zwrócił poprawnego formatu JSON.")
-            # Usuwamy ostatnie zapytanie użytkownika, by niespójna odpowiedź nie zatruła pamięci
+            print(" -> [BŁĄD]: Niepoprawny JSON.")
             chat_history.pop()
         except requests.exceptions.RequestException as e:
-            print(f"\n[BŁĄD POŁĄCZENIA Z OLLAMĄ]: {e}")
+            print(f" -> [BŁĄD OLLAMA]: {e}")
             chat_history.pop()
-
 
 if __name__ == "__main__":
     main()
