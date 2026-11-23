@@ -6,15 +6,16 @@ from rcl_interfaces.msg import SetParametersResult
 from nav_msgs.msg import Odometry
 from actuator_msgs.msg import Actuators
 
-# Wczytujemy nasze moduły inżynierskie
 from dron_sterowanie.pid import PID
 from dron_sterowanie.math_utils import euler_from_quaternion
 
 
 class AttitudeControllerNode(Node):
     """
-    Węzeł spinający logikę lotu. Zarządza komunikacją z ROS 2 (odometria i parametry)
-    oraz wywołuje wyliczenia PID w odpowiedniej kolejności.
+    Kaskadowy sterownik drona X3 obsługujący dwa tryby pracy:
+    1. Tryb prędkościowo-kątowy (use_pos_pid=False): zadawane target_roll, target_pitch, target_vz, target_yaw_rate.
+    2. Tryb pozycyjny (use_pos_pid=True): nadrzędna pętla (pid_x, pid_y, pid_z) w układzie świata +
+       transformacja przez kąt Yaw na zadane kąty Pitch i Roll dla pętli podrzędnej.
     """
     def __init__(self):
         super().__init__('regulator_node')
@@ -22,133 +23,187 @@ class AttitudeControllerNode(Node):
         self.max_motor_speed = 800.0
         self.min_motor_speed = 0.0
 
-        # current_z to wysokość na ten moment, held_z to docelowy pułap "zatrzaśnięty" do zawisu
+        # Bieżąca pozycja drona z odometrii oraz zatrzaskiwany pułap
+        self.current_x = None
+        self.current_y = None
         self.current_z = None
         self.held_z = None
 
-        # Inicjalizacja instancji matematycznych regulatorów PID (Kp, Ki, Kd podane na start)
+        # Pętla podrzędna (orientacja) oraz wysokość Z
         self.pid_roll = PID(110.0, 5.0, 28.0, out_limit=140.0, i_limit=30.0)
         self.pid_pitch = PID(110.0, 5.0, 28.0, out_limit=140.0, i_limit=30.0)
         self.pid_yaw_rate = PID(180.0, 0.0, 5.0, out_limit=80.0, i_limit=20.0)
         self.pid_z = PID(75.0, 8.0, 65.0, out_limit=120.0, i_limit=40.0)
 
-        # Deklaracja infrastruktury parametrów ROS 2
+        # Pętla nadrzędna (pozycja XY w układzie świata -> wirtualne sterowanie przed obrotem)
+        self.pid_x = PID(0.35, 0.02, 0.25, out_limit=0.25, i_limit=0.10)
+        self.pid_y = PID(0.35, 0.02, 0.25, out_limit=0.25, i_limit=0.10)
+
         default_parameters = [
             ('use_rp_pid', True), ('use_yaw_pid', True), ('use_z_pid', True),
+            ('use_pos_pid', False),
             ('base_throttle', 660.4),
             ('target_roll', 0.0), ('target_pitch', 0.0), ('target_yaw_rate', 0.0), ('target_vz', 0.0),
+            ('target_x', 0.0), ('target_y', 0.0), ('target_z', 0.0),
             ('kp_rp', 110.0), ('ki_rp', 5.0), ('kd_rp', 28.0),
             ('kp_yaw', 180.0), ('ki_yaw', 0.0), ('kd_yaw', 5.0),
             ('kp_z', 75.0), ('ki_z', 8.0), ('kd_z', 65.0),
+            ('kp_xy', 0.35), ('ki_xy', 0.02), ('kd_xy', 0.25),
         ]
         self.declare_parameters(namespace='', parameters=default_parameters)
         self._read_initial_parameters()
 
-        # Zarejestrowanie funkcji callback reagującej na zdarzenie zmiany parametrów z terminala/AI
         self.add_on_set_parameters_callback(self.parameters_callback)
 
         self.last_time = None
-        self.step_counter = 0
 
-        # Subskrybent (odbiór danych o locie z Gazebo) i Publisher (wysyłka poleceń na silniki)
         self.odom_sub = self.create_subscription(Odometry, '/model/X3/odometry', self.odom_callback, 10)
         self.motor_pub = self.create_publisher(Actuators, '/X3/command/motor_speed', 10)
 
-        self.get_logger().info('Sterownik drona uruchomiony!')
+        self.get_logger().info('Kaskadowy sterownik drona (Attitude + Position) uruchomiony!')
 
     def _read_initial_parameters(self):
-        """Pobiera początkowe stany wszystkich zmiennych z bufora parametrów ROS 2."""
         self.use_rp_pid = bool(self.get_parameter('use_rp_pid').value)
         self.use_yaw_pid = bool(self.get_parameter('use_yaw_pid').value)
         self.use_z_pid = bool(self.get_parameter('use_z_pid').value)
+        self.use_pos_pid = bool(self.get_parameter('use_pos_pid').value)
+
         self.base_throttle = float(self.get_parameter('base_throttle').value)
         self.target_roll = float(self.get_parameter('target_roll').value)
         self.target_pitch = float(self.get_parameter('target_pitch').value)
         self.target_yaw_rate = float(self.get_parameter('target_yaw_rate').value)
         self.target_vz = float(self.get_parameter('target_vz').value)
 
+        self.target_x = float(self.get_parameter('target_x').value)
+        self.target_y = float(self.get_parameter('target_y').value)
+        self.target_z = float(self.get_parameter('target_z').value)
+
         self.pid_roll.kp = self.pid_pitch.kp = float(self.get_parameter('kp_rp').value)
         self.pid_roll.ki = self.pid_pitch.ki = float(self.get_parameter('ki_rp').value)
         self.pid_roll.kd = self.pid_pitch.kd = float(self.get_parameter('kd_rp').value)
+
         self.pid_yaw_rate.kp = float(self.get_parameter('kp_yaw').value)
         self.pid_yaw_rate.ki = float(self.get_parameter('ki_yaw').value)
         self.pid_yaw_rate.kd = float(self.get_parameter('kd_yaw').value)
+
         self.pid_z.kp = float(self.get_parameter('kp_z').value)
         self.pid_z.ki = float(self.get_parameter('ki_z').value)
         self.pid_z.kd = float(self.get_parameter('kd_z').value)
 
+        self.pid_x.kp = self.pid_y.kp = float(self.get_parameter('kp_xy').value)
+        self.pid_x.ki = self.pid_y.ki = float(self.get_parameter('ki_xy').value)
+        self.pid_x.kd = self.pid_y.kd = float(self.get_parameter('kd_xy').value)
+
     def parameters_callback(self, params):
-        """Obsługuje dynamiczne zmiany podczas lotu wysyłane przez most AI lub użytkownika."""
+        param_map = {p.name: p.value for p in params}
+
+        # 1. Obsługa trybu pozycji i zatrzaskiwania bieżącego punktu
+        if 'use_pos_pid' in param_map:
+            new_pos_mode = bool(param_map['use_pos_pid'])
+            if new_pos_mode:
+                latched_xy = ('target_x' not in param_map) and ('target_y' not in param_map)
+                if not self.use_pos_pid or latched_xy:
+                    self.pid_x.reset()
+                    self.pid_y.reset()
+
+                # Zatrzaskujemy współrzędne zawsze, gdy nie podano ich jawnie (działa też jako "stop" w locie)
+                if 'target_x' not in param_map and self.current_x is not None:
+                    self.target_x = self.current_x
+                if 'target_y' not in param_map and self.current_y is not None:
+                    self.target_y = self.current_y
+                if 'target_z' not in param_map and self.current_z is not None:
+                    self.target_z = self.current_z
+                    self.held_z = self.current_z
+
+                self.target_vz = 0.0
+                self.get_logger().info(
+                    f'Tryb POSITION -> cel: X={self.target_x:.2f}, Y={self.target_y:.2f}, Z={self.target_z:.2f}'
+                )
+            elif self.use_pos_pid:
+                self.pid_x.reset()
+                self.pid_y.reset()
+                self.get_logger().info('Wyłączono tryb POSITION (powrót do trybu prędkościowego).')
+            self.use_pos_pid = new_pos_mode
+
+        # 2. Obsługa pozostałych parametrów
         for p in params:
             name, val = p.name, p.value
-
-            # Przełączniki systemowe
-            if name == 'use_rp_pid': self.use_rp_pid = bool(val)
-            elif name == 'use_yaw_pid': self.use_yaw_pid = bool(val)
+            if name == 'use_pos_pid':
+                continue
+            elif name == 'use_rp_pid':
+                self.use_rp_pid = bool(val)
+            elif name == 'use_yaw_pid':
+                self.use_yaw_pid = bool(val)
             elif name == 'use_z_pid':
                 self.use_z_pid = bool(val)
-                # W momencie włączenia stabilizacji pionowej natychmiast celujemy w bieżącą wysokość
                 if self.use_z_pid and self.current_z is not None:
                     self.held_z = self.current_z
-            elif name == 'base_throttle': self.base_throttle = float(val)
+            elif name == 'base_throttle':
+                self.base_throttle = float(val)
 
-            # Komendy ruchu sterującego (trajektorii)
-            elif name == 'target_roll': self.target_roll = float(val)
-            elif name == 'target_pitch': self.target_pitch = float(val)
-            elif name == 'target_yaw_rate': self.target_yaw_rate = float(val)
+            elif name == 'target_roll':
+                self.target_roll = float(val)
+            elif name == 'target_pitch':
+                self.target_pitch = float(val)
+            elif name == 'target_yaw_rate':
+                self.target_yaw_rate = float(val)
             elif name == 'target_vz':
                 self.target_vz = float(val)
-                # Gdy wyłączamy komendę wznoszenia (target_vz -> 0.0), zatrzaskujemy
-                # tę konkretną wysokość do utrzymania jako "punkt docelowy" zawisu (held_z).
-                if self.current_z is not None:
+                if not self.use_pos_pid and self.current_z is not None:
                     self.held_z = self.current_z
 
-            # Nadpisywanie parametrów dla obiektu PID_RP
+            elif name == 'target_x':
+                self.target_x = float(val)
+            elif name == 'target_y':
+                self.target_y = float(val)
+            elif name == 'target_z':
+                self.target_z = float(val)
+                if self.use_pos_pid:
+                    self.held_z = max(0.05, self.target_z)
+                    self.target_vz = 0.0
+
             elif name == 'kp_rp': self.pid_roll.kp = self.pid_pitch.kp = float(val)
             elif name == 'ki_rp': self.pid_roll.ki = self.pid_pitch.ki = float(val)
             elif name == 'kd_rp': self.pid_roll.kd = self.pid_pitch.kd = float(val)
-
-            # Nadpisywanie parametrów dla obiektu PID_YAW
             elif name == 'kp_yaw': self.pid_yaw_rate.kp = float(val)
             elif name == 'ki_yaw': self.pid_yaw_rate.ki = float(val)
             elif name == 'kd_yaw': self.pid_yaw_rate.kd = float(val)
-
-            # Nadpisywanie parametrów dla obiektu PID_Z
             elif name == 'kp_z': self.pid_z.kp = float(val)
             elif name == 'ki_z': self.pid_z.ki = float(val)
             elif name == 'kd_z': self.pid_z.kd = float(val)
+            elif name == 'kp_xy': self.pid_x.kp = self.pid_y.kp = float(val)
+            elif name == 'ki_xy': self.pid_x.ki = self.pid_y.ki = float(val)
+            elif name == 'kd_xy': self.pid_x.kd = self.pid_y.kd = float(val)
 
         return SetParametersResult(successful=True)
 
     def odom_callback(self, msg: Odometry):
-        """Serce sterownika wywoływane automatycznie za każdym nowym pomiarem odometrii (np. 50 Hz)."""
         now = self.get_clock().now()
         if self.last_time is None:
             self.last_time = now
             return
 
-        # Obliczanie realnego czasu (dt), jaki upłynął od ostatniej iteracji pętli
         dt = (now - self.last_time).nanoseconds / 1e9
         self.last_time = now
 
-        # --- DETEKCJA RESETU SYMULATORA GAZEBO ---
-        # Jeśli dt < 0, oznacza to, że zegar w Gazebo został cofnięty (Reset World).
+        # Detekcja resetu symulacji Gazebo
         if dt < 0.0:
             self.get_logger().warn('Wykryto restart symulacji Gazebo! Czyszczenie pamięci regulatora.')
-            self.held_z = None          # Zapominamy starą wysokość
-            self.target_vz = 0.0        # Zerujemy komendy prędkości
+            self.held_z = None
+            self.use_pos_pid = False
+            self.target_vz = 0.0
             self.target_roll = 0.0
             self.target_pitch = 0.0
             self.target_yaw_rate = 0.0
 
-        # Jeśli czas przeskoczył zbyt gwałtownie, resetujemy bufory całek (I) i pochodnych (D)
         if dt <= 0.0 or dt > 0.5:
-            for pid in (self.pid_roll, self.pid_pitch, self.pid_yaw_rate, self.pid_z):
+            for pid in (self.pid_roll, self.pid_pitch, self.pid_yaw_rate, self.pid_z, self.pid_x, self.pid_y):
                 pid.reset()
             return
 
-        # Zczytywanie stanu świata z symulacji
         pos = msg.pose.pose.position
+        self.current_x = pos.x
+        self.current_y = pos.y
         self.current_z = pos.z
         if self.held_z is None:
             self.held_z = pos.z
@@ -157,55 +212,80 @@ class AttitudeControllerNode(Node):
         roll, pitch, yaw = euler_from_quaternion(q.x, q.y, q.z, q.w)
         current_yaw_rate = msg.twist.twist.angular.z
 
-        # ------------------- STEROWANIE WYSOKOŚCIĄ Z -------------------
+        # ------------------- 1. STEROWANIE WYSOKOŚCIĄ Z -------------------
         if self.use_z_pid:
-            # Manewr wznoszenia/opadania: presuwamy wirtualny punkt w górę lub dół (z prędkością Vz)
-            if abs(self.target_vz) > 1e-4:
+            if self.use_pos_pid:
+                self.held_z = max(0.05, self.target_z)
+            elif abs(self.target_vz) > 1e-4:
                 self.held_z = max(0.05, self.held_z + self.target_vz * dt)
 
-            # Logika "Lądowania / Postoju na ziemi" - jeśli dron leży, gasimy silniki by nie buczały
             if self.held_z < 0.35 and self.target_vz <= 0.0 and pos.z < 0.35:
                 self.pid_z.reset()
                 u_z = 0.0
             else:
                 e_z = self.held_z - pos.z
                 u_z_corr = self.pid_z.compute(e_z, dt)
-
-                # Zjawisko odchylania ciągu: gdy przechylasz drona do lotu w przód, ucieka mu wektor
-                # ciągu pionowego. Tilt_factor kompensuje to, dodając moc proporcjonalnie do kąta.
                 tilt_factor = max(0.6, math.cos(roll) * math.cos(pitch))
                 u_z = (self.base_throttle + u_z_corr) / tilt_factor
         else:
             self.pid_z.reset()
             u_z = self.base_throttle
 
-        # ------------------- STEROWANIE POZIOME ROLL I PITCH -------------------
-        # Aktywne dopiero wtedy, gdy dron ma wyliczony ciąg wznoszący (u_z > 0), by nie sterował leżąc
+        # ------------------- 2. PĘTLA NADRZĘDNA POZYCJI XY (KASKADA) -------------------
+        if self.use_pos_pid and u_z > 0.0:
+            if pos.z > 0.35:
+                # 1. Uchyb i PID w układzie świata [m -> wirtualne sterowanie u_x, u_y]
+                e_x_world = self.target_x - pos.x
+                e_y_world = self.target_y - pos.y
+                u_x = self.pid_x.compute(e_x_world, dt)
+                u_y = self.pid_y.compute(e_y_world, dt)
+
+                # 2. Transformacja do układu lokalnego drona (obrót o kąt Yaw + konwencja znaku Roll)
+                cos_y = math.cos(yaw)
+                sin_y = math.sin(yaw)
+                raw_pitch = u_x * cos_y + u_y * sin_y
+                raw_roll = u_x * sin_y - u_y * cos_y
+
+                # 3. Twardy limit końcowych kątów zadanych po obrocie [rad]
+                max_tilt = 0.25
+                eff_target_pitch = max(-max_tilt, min(max_tilt, raw_pitch))
+                eff_target_roll = max(-max_tilt, min(max_tilt, raw_roll))
+            else:
+                # Podczas odrywania się od ziemi startujemy pionowo, bez przechyłu
+                self.pid_x.reset()
+                self.pid_y.reset()
+                eff_target_pitch = 0.0
+                eff_target_roll = 0.0
+        else:
+            self.pid_x.reset()
+            self.pid_y.reset()
+            eff_target_pitch = self.target_pitch
+            eff_target_roll = self.target_roll
+
+        # ------------------- 3. PĘTLA PODRZĘDNA ORIENTACJI (ROLL / PITCH) -------------------
         if self.use_rp_pid and u_z > 0.0:
-            u_phi = self.pid_roll.compute(self.target_roll - roll, dt)
-            u_theta = self.pid_pitch.compute(self.target_pitch - pitch, dt)
+            u_phi = self.pid_roll.compute(eff_target_roll - roll, dt)
+            u_theta = self.pid_pitch.compute(eff_target_pitch - pitch, dt)
         else:
             self.pid_roll.reset()
             self.pid_pitch.reset()
             u_phi = u_theta = 0.0
 
-        # ------------------- STEROWANIE YAW RATE (OS Z) -------------------
+        # ------------------- 4. STEROWANIE YAW RATE -------------------
         if self.use_yaw_pid and u_z > 0.0:
             u_psi = self.pid_yaw_rate.compute(self.target_yaw_rate - current_yaw_rate, dt)
         else:
             self.pid_yaw_rate.reset()
             u_psi = 0.0
 
-        # ------------------- MIKSER KINEMATYCZNY (UKŁAD X) -------------------
+        # ------------------- 5. MIKSER KINEMATYCZNY (UKŁAD X) -------------------
         if u_z <= 0.0:
             speeds = [0.0, 0.0, 0.0, 0.0]
         else:
-            # Miksujemy poszczególne zadania regulacji obciążając każdy z 4 silników w układzie "Krzyża"
             w1 = u_z - u_phi - u_theta - u_psi
             w2 = u_z + u_phi + u_theta - u_psi
             w3 = u_z + u_phi - u_theta + u_psi
             w4 = u_z - u_phi + u_theta + u_psi
-            # Docinanie obrotów by nie wylecieć poza okno fizycznie wspierane w Gazebo (saturacja)
             speeds = [float(max(self.min_motor_speed, min(self.max_motor_speed, w))) for w in (w1, w2, w3, w4)]
 
         out_msg = Actuators()
@@ -213,15 +293,14 @@ class AttitudeControllerNode(Node):
         self.motor_pub.publish(out_msg)
 
     def stop_motors(self):
-        """Bezpiecznie ubija komendy przesyłane na silniki przy twardym zamknięciu węzła."""
         stop_msg = Actuators()
         stop_msg.velocity = [0.0, 0.0, 0.0, 0.0]
         for _ in range(3):
             self.motor_pub.publish(stop_msg)
             time.sleep(0.02)
 
+
 def main(args=None):
-    # Wyłączenie standardowej obsługi sygnałów, by móc zdefiniować wlasny blok na KeyboardInterrupt
     rclpy.init(args=args, signal_handler_options=rclpy.SignalHandlerOptions.NO)
     node = AttitudeControllerNode()
     try:
@@ -232,6 +311,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

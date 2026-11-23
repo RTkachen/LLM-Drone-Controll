@@ -4,6 +4,7 @@ regulator_node:
     use_rp_pid: true
     use_yaw_pid: true
     use_z_pid: true
+    use_pos_pid: false
 
     # Ciąg bazowy zawisu [rad/s]
     base_throttle: 660.4
@@ -13,6 +14,10 @@ regulator_node:
     target_pitch: 0.0      # Pochylenie przód (+)/tył (-) [rad]
     target_yaw_rate: 0.0   # Prędkość obrotu wokół osi Z [rad/s]
     target_vz: 0.0         # Prędkość wznoszenia (+)/opadania (-) [m/s] (0.0 = utrzymuj obecną wysokość)
+
+    target_x: 0.0
+    target_y: 0.0
+    target_z: 0.0
 
     # Nastawy PID orientacji poziomej (Roll i Pitch)
     kp_rp: 110.0
@@ -28,3 +33,7 @@ regulator_node:
     kp_z: 75.0
     ki_z: 8.0
     kd_z: 65.0
+
+    kp_xy: 0.35
+    ki_xy: 0.02
+    kd_xy: 0.25

@@ -8,15 +8,8 @@ import requests
 
 # AKTYWNE: Połączenie lokalne (gdy skrypt i Ollama działają na tym samym PC z Windowsem)
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-
-# Adres serwera HTTP na laptopie z ROS 2 (czyli uruchomionego węzła most_ai.py).
-# UWAGA: Musisz podmienić '192.168.1.X' na rzeczywisty adres IP Twojego laptopa w sieci Wi-Fi.
 LAPTOP_URL = "http://192.168.1.56:5000"
-
-# Nazwa używanego modelu (musi być wcześniej pobrany komendą 'ollama pull qwen3:8b')
 MODEL_NAME = "qwen3:8b"
-
-# Plik zapisu dla promptu systemowego, pozwalający na jego edycję bez zmiany kodu.
 CONTEXT_FILE = "kontekst_lotu.json"
 
 
@@ -83,6 +76,11 @@ JSON_SCHEMA = {
     "type": "object",
     "properties": {
         "odpowiedz_dla_uzytkownika": {"type": "string"},
+        "mode": {"type": "string", "enum": ["velocity", "position"]},
+        "hold_current": {"type": "boolean"},
+        "target_x": {"type": "number"},
+        "target_y": {"type": "number"},
+        "target_z": {"type": "number"},
         "target_roll": {"type": "number"},
         "target_pitch": {"type": "number"},
         "target_vz": {"type": "number"},
@@ -90,41 +88,26 @@ JSON_SCHEMA = {
         "duration_sec": {"type": "number"}
     },
     "required": [
-        "odpowiedz_dla_uzytkownika",
-        "target_roll",
-        "target_pitch",
-        "target_vz",
-        "target_yaw_rate",
-        "duration_sec"
+        "odpowiedz_dla_uzytkownika", "mode", "hold_current",
+        "target_x", "target_y", "target_z",
+        "target_roll", "target_pitch", "target_vz", "target_yaw_rate", "duration_sec"
     ]
 }
 
-# ==============================================================================
-# 3. KONTEKST SYSTEMOWY DRONA X3 (WPISANY NA SZTYWNO + ZAPIS DO PLIKU JSON)
-# ==============================================================================
+COMMAND_LEGEND_JSON = {
+    "mode": "'position' (utrzymanie punktu lub lot na współrzędne X,Y,Z) lub 'velocity' (lot kierunkowy przez czas)",
+    "hold_current": "true = zatrzymaj się i trzymaj bieżący punkt (zatrzymaj się/zawiśnij/włącz pozycję); false = leć do target_x,y,z",
+    "osie_velocity": "lewo=-roll, prawo=+roll, przód=+pitch, tył=-pitch, góra=+vz, dół=-vz",
+    "predkosci": "powoli=0.05 (vz 0.2), zwykle=0.15 (vz 0.5), szybko=0.3 (vz 1.0); brak czasu -> duration_sec=2.0",
+    "regula_zerowania": "niewymienione pola ruchu ustaw na 0.0; przy locie w trybie position ustaw pola velocity na 0.0"
+}
 
-# Nowy, kuloodporny prompt - abstrakcyjny, oparty na intencjach
-DEFAULT_SYSTEM_PROMPT = """Jesteś asystentem sterowania dronem X3. Tłumaczysz intencje na surowy format JSON. Użytkownik używa dowolnego szyku (np. "do przodu i w lewo").
+DEFAULT_SYSTEM_PROMPT = """Jesteś asystentem sterowania dronem X3 w ROS 2.
+W każdej wiadomości otrzymujesz obiekt JSON ze stanem drona, legendą komend oraz poleceniem operatora.
+Zwracaj WYŁĄCZNIE poprawny JSON zgodny ze schematem:
+- Jeśli użytkownik prosi o zatrzymanie, zawis w punkcie, włączenie pozycjonowania lub lot do konkretnych współrzędnych [X, Y, Z], wybierz mode='position'.
+- Jeśli użytkownik prosi o ruch kierunkowy (np. w przód, w lewo, na skos, w górę przez N sekund), wybierz mode='velocity' (po czasie dron sam zakotwiczy pozycję)."""
 
-WARTOŚCI BAZOWE (Dla aktywnej osi ruchu):
-1. Zwykła prędkość: 0.15 (dla Vz 0.5)
-2. Powoli / delikatnie: 0.05 (dla Vz 0.2)
-3. Szybko / najszybciej: 0.3 (dla Vz 1.0)
-
-KIERUNKI:
-- W lewo -> target_roll (Ujemny)
-- W prawo -> target_roll (Dodatni)
-- Do przodu -> target_pitch (Dodatni)
-- Do tyłu -> target_pitch (Ujemny)
-- W górę / do góry -> target_vz (Dodatni)
-- W dół / do dołu -> target_vz (Ujemny)
-
-BARDZO WAŻNE REGUŁY:
-1. NIEWYMIENIONE w komendzie osie ruchu ZAWSZE ustawiaj na 0.0.
-2. Czas (duration_sec): Jeśli nie podano w komendzie, ZAWSZE ustawiaj na 2.0.
-3. Przy skosach (np. "do przodu w lewo powoli") ustaw oba wymienione parametry na zadaną wartość.
-4. "Zatrzymaj się / zawiśnij": Wszystkie targety = 0.0, czas = 0.0.
-5. odpowiedz_dla_uzytkownika: Jedno zdanie po polsku."""
 
 def load_or_create_system_prompt(filepath: str) -> str:
     if os.path.exists(filepath):
@@ -134,6 +117,7 @@ def load_or_create_system_prompt(filepath: str) -> str:
         json.dump({"system_prompt": DEFAULT_SYSTEM_PROMPT}, f, ensure_ascii=False, indent=2)
     return DEFAULT_SYSTEM_PROMPT
 
+
 def clean_json_response(raw_text: str) -> dict:
     text = raw_text.strip()
     if text.startswith("```json"): text = text[7:]
@@ -141,22 +125,42 @@ def clean_json_response(raw_text: str) -> dict:
     if text.endswith("```"): text = text[:-3]
     return json.loads(text.strip())
 
+
 def estimate_true_history_tokens(chat_history: list) -> int:
     total_chars = sum(len(msg["content"]) for msg in chat_history)
     return int(total_chars / 3.2)
 
-def send_message_to_llm(chat_history: list) -> dict:
+
+def get_drone_state() -> dict:
+    try:
+        res = requests.get(f"{LAPTOP_URL}/state", timeout=1)
+        res.raise_for_status()
+        return res.json()
+    except requests.exceptions.RequestException:
+        return {"mode": "nieznany", "position": {"x": 0.0, "y": 0.0, "z": 0.0}}
+
+
+def send_message_to_llm(chat_history: list, current_user_input: str, drone_state: dict):
+    wrapped_user_msg = json.dumps({
+        "stan_drona": drone_state,
+        "legenda_komend": COMMAND_LEGEND_JSON,
+        "polecenie_uzytkownika": current_user_input
+    }, ensure_ascii=False)
+
+    messages_for_api = chat_history + [{"role": "user", "content": wrapped_user_msg}]
+
     payload = {
         "model": MODEL_NAME,
-        "messages": chat_history,
+        "messages": messages_for_api,
         "stream": False,
         "options": MODEL_OPTIONS,
         "keep_alive": KEEP_ALIVE,
-        "format": JSON_SCHEMA 
+        "format": JSON_SCHEMA
     }
     response = requests.post(OLLAMA_URL, json=payload, timeout=60)
     response.raise_for_status()
     return clean_json_response(response.json()["message"]["content"]), response.json()
+
 
 def send_command_to_laptop(command_json: dict):
     try:
@@ -165,11 +169,12 @@ def send_command_to_laptop(command_json: dict):
     except requests.exceptions.RequestException as e:
         print(f" -> [ROS 2 BŁĄD]: {e}")
 
+
 def main():
     system_prompt = load_or_create_system_prompt(CONTEXT_FILE)
     chat_history = [{"role": "system", "content": system_prompt}]
 
-    print(f"--- AI DRONE CHAT ({MODEL_NAME}) GOTOWY ---")
+    print(f"--- AI DRONE CHAT ({MODEL_NAME}) | Komendy: /pos on, /pos off, /reset, /wyjdz ---")
 
     while True:
         try:
@@ -184,29 +189,44 @@ def main():
             print(" -> [INFO]: Pamięć wyczyszczona.")
             continue
 
-        chat_history.append({"role": "user", "content": user_input})
+        if user_input.lower() == "/pos on":
+            send_command_to_laptop({"mode": "position", "hold_current": True})
+            continue
+        if user_input.lower() == "/pos off":
+            send_command_to_laptop({
+                "mode": "velocity", "target_roll": 0.0, "target_pitch": 0.0,
+                "target_vz": 0.0, "target_yaw_rate": 0.0, "duration_sec": 0.0, "auto_hold_after": False
+            })
+            continue
+
+        drone_state = get_drone_state()
 
         try:
-            command_json, diag_data = send_message_to_llm(chat_history)
+            command_json, diag_data = send_message_to_llm(chat_history, user_input, drone_state)
+
+            chat_history.append({"role": "user", "content": user_input})
             chat_history.append({"role": "assistant", "content": json.dumps(command_json, ensure_ascii=False)})
 
             print(f"AI: {command_json.get('odpowiedz_dla_uzytkownika')}")
-            print(f" -> [PARAM]: R={command_json.get('target_roll')} P={command_json.get('target_pitch')} Vz={command_json.get('target_vz')} t={command_json.get('duration_sec')}s")
-            
+            if command_json.get("mode") == "position":
+                print(f" -> [POS]: hold={command_json.get('hold_current')} | "
+                      f"X={command_json.get('target_x')} Y={command_json.get('target_y')} Z={command_json.get('target_z')}")
+            else:
+                print(f" -> [VEL]: R={command_json.get('target_roll')} P={command_json.get('target_pitch')} "
+                      f"Vz={command_json.get('target_vz')} t={command_json.get('duration_sec')}s")
+
             send_command_to_laptop(command_json)
 
             tokens_per_sec = diag_data.get("eval_count", 0) / (diag_data.get("eval_duration", 1) / 1e9)
             true_tok = estimate_true_history_tokens(chat_history)
             ctx_pct = (true_tok / MODEL_OPTIONS["num_ctx"]) * 100
-            
-            print(f" -> [DIAG]: {len(chat_history)} wiadomości | Pamięć: ~{true_tok}/{MODEL_OPTIONS['num_ctx']} ({ctx_pct:.1f}%) | Prędkość: {tokens_per_sec:.1f} tok/s")
+            print(f" -> [DIAG]: {len(chat_history)} wiad. | Pamięć: ~{true_tok}/{MODEL_OPTIONS['num_ctx']} ({ctx_pct:.1f}%) | {tokens_per_sec:.1f} tok/s")
 
         except json.JSONDecodeError:
             print(" -> [BŁĄD]: Niepoprawny JSON.")
-            chat_history.pop()
         except requests.exceptions.RequestException as e:
             print(f" -> [BŁĄD OLLAMA]: {e}")
-            chat_history.pop()
+
 
 if __name__ == "__main__":
     main()
