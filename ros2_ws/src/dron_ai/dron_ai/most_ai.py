@@ -72,41 +72,31 @@ class MostAINode(Node):
             self.maneuver_id += 1
             my_id = self.maneuver_id
 
-        mode = str(json_data.get("mode", "velocity")).lower()
+        mode = str(json_data.get("mode", "position")).lower()
 
-        # ---------------- TRYB POZYCYJNY ----------------
+        # ---------------- TRYB 1: LOT / ZAWIS W PUNKCIE [X, Y, Z] ----------------
         if mode == "position":
             self.current_mode = "position"
-            hold_current = bool(json_data.get("hold_current", False))
-
-            if hold_current:
-                self.get_logger().info("POSITION HOLD -> zatrzaskiwanie bieżącej pozycji [X, Y, Z].")
-                self.send_parameters_to_controller({
-                    "use_pos_pid": True,
-                    "target_yaw_rate": 0.0,
-                })
-            else:
-                tx = float(json_data.get("target_x", self.current_pos["x"]))
-                ty = float(json_data.get("target_y", self.current_pos["y"]))
-                tz = float(json_data.get("target_z", self.current_pos["z"]))
-                self.get_logger().info(f"POSITION GOTO -> X={tx:.2f}, Y={ty:.2f}, Z={tz:.2f}")
-                self.send_parameters_to_controller({
-                    "use_pos_pid": True,
-                    "target_x": tx,
-                    "target_y": ty,
-                    "target_z": tz,
-                    "target_yaw_rate": 0.0,
-                })
+            tx = float(json_data.get("target_x", self.current_pos["x"]))
+            ty = float(json_data.get("target_y", self.current_pos["y"]))
+            tz = float(json_data.get("target_z", self.current_pos["z"]))
+            self.get_logger().info(f"POSITION -> X={tx:.2f}, Y={ty:.2f}, Z={tz:.2f}")
+            self.send_parameters_to_controller({
+                "use_pos_pid": True,
+                "target_x": tx,
+                "target_y": ty,
+                "target_z": tz,
+                "target_yaw_rate": 0.0,
+            })
             return
 
-        # ---------------- TRYB PRĘDKOŚCIOWY ----------------
+        # ---------------- TRYB 2: LOT PRĘDKOŚCIOWY PRZEZ CZAS ----------------
         self.current_mode = "velocity"
         target_roll = float(json_data.get("target_roll", 0.0))
         target_pitch = float(json_data.get("target_pitch", 0.0))
         target_vz = float(json_data.get("target_vz", 0.0))
         target_yaw_rate = float(json_data.get("target_yaw_rate", 0.0))
         duration = float(json_data.get("duration_sec", 2.0))
-        auto_hold = bool(json_data.get("auto_hold_after", True))
 
         self.get_logger().info(
             f"VELOCITY -> R={target_roll}, P={target_pitch}, Vz={target_vz}, Yaw={target_yaw_rate}, t={duration}s"
@@ -123,9 +113,8 @@ class MostAINode(Node):
         if duration > 0.0:
             time.sleep(duration)
             if my_id != self.maneuver_id:
-                return  # Nadeszła nowsza komenda
+                return
 
-            # 1. Wyrównanie kątów i zatrzymanie Vz
             self.send_parameters_to_controller({
                 "target_roll": 0.0,
                 "target_pitch": 0.0,
@@ -133,14 +122,12 @@ class MostAINode(Node):
                 "target_yaw_rate": 0.0,
             })
 
-            # 2. Krótka pauza na wytracenie pędu i automatyczne zakotwiczenie pozycji
-            if auto_hold:
-                time.sleep(0.4)
-                if my_id != self.maneuver_id:
-                    return
-                self.current_mode = "position"
-                self.get_logger().info("Koniec manewru -> automatyczne przejście w POSITION HOLD.")
-                self.send_parameters_to_controller({"use_pos_pid": True})
+            time.sleep(0.4)
+            if my_id != self.maneuver_id:
+                return
+            self.current_mode = "position"
+            self.get_logger().info("Koniec manewru -> powrót do POSITION w bieżącym punkcie.")
+            self.send_parameters_to_controller({"use_pos_pid": True})
 
 
 class HttpServerHandler(http.server.BaseHTTPRequestHandler):
