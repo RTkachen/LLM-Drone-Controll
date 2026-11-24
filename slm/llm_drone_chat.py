@@ -1,129 +1,110 @@
 import json
-import os
+import math
 import requests
 
 # ==============================================================================
-# 1. KONFIGURACJA POŁĄCZENIA (LOKALNIE VS SIEĆ LAN Z LAPTOPEM ROS 2)
+# 1. KONFIGURACJA POŁĄCZENIA
 # ==============================================================================
-
-# AKTYWNE: Połączenie lokalne (gdy skrypt i Ollama działają na tym samym PC z Windowsem)
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 LAPTOP_URL = "http://192.168.1.56:5000"
 MODEL_NAME = "qwen3:8b"
-CONTEXT_FILE = "kontekst_lotu.json"
-
+MAX_HISTORY_TURNS = 6
 
 # ==============================================================================
-# 2. JAWNA KONFIGURACJA PARAMETRÓW MODELU LLM (WPŁYW NA DZIAŁANIE I PERFORMANCE)
+# 2. KONFIGURACJA PARAMETRÓW MODELU LLM
 # ==============================================================================
 MODEL_OPTIONS = {
-    # num_ctx: Rozmiar okna kontekstowego (pamięci krótkotrwałej konwersacji) w tokenach.
-    # - Działanie: Określa, ile maksymalnie tokenów (prompt systemowy + cała historia czatu + nowa odpowiedź)
-    #   model pamięta jednocześnie. Po przekroczeniu tego limitu najstarsze wiadomości są ucinane.
-    # - Performance (VRAM): Kluczowy parametr dla karty 8 GB! Zwiększanie num_ctx liniowo pożera pamięć VRAM
-    #   na tzw. bufor KV Cache. Wartość 8192 (8k tokenów) zużywa ok. 1.2 GB VRAM (cały model + kontekst ~ 6.2 GB),
-    #   co pozwala utrzymać 100% obliczeń na GPU bez spadku prędkości. Ustawienie np. 32768 przepełni 8 GB VRAM.
     "num_ctx": 8192,
-
-    # num_predict: Maksymalna liczba tokenów, jaką model może wygenerować w JEDNEJ odpowiedzi.
-    # - Działanie: Chroni przed zbyt długimi wywodami. Wartość -1 oznacza brak limitu (aż do końca num_ctx).
-    # - Performance (Czas): Generowanie każdego kolejnego tokenu trwa ok. 15-25 ms. Ustawienie 1024 gwarantuje,
-    #   że odpowiedź nigdy nie będzie trwała dłużej niż kilkanaście sekund.
-    "num_predict": 1024,
-
-    # temperature: Poziom losowości / kreatywności modelu (zakres zazwyczaj od 0.0 do 2.0).
-    # - Działanie: Rozpłaszcza lub wyostrza rozkład prawdopodobieństwa kolejnych słów.
-    #   0.0 = pełny determinizm (model zawsze wybierze najbardziej prawdopodobny token, świetne do JSON/matematyki).
-    #   0.2 - 0.4 = odpowiedzi bardzo rzeczowe, techniczne, ale z niewielką elastycznością przy szukaniu nastaw PID.
-    #   0.8+ = wysoka kreatywność, większe ryzyko zmyślania (halucynacji) wzorów.
-    # - Performance: Brak wpływu na zużycie VRAM i prędkość generowania.
-    "temperature": 0.15,
-
-    # top_p (Nucleus Sampling): Próg skumulowanego prawdopodobieństwa (od 0.0 do 1.0).
-    # - Działanie: Model bierze pod uwagę tylko te słowa, których suma prawdopodobieństw wynosi top_p (np. 0.9 = 90%).
-    #   Odcina najbardziej nieprawdopodobne, bezsensowne słowa z "ogona" rozkładu.
-    # - Performance: Brak zauważalnego wpływu na szybkość.
+    "num_predict": 450,
+    "temperature": 0.0,
     "top_p": 0.9,
-
-    # top_k: Ograniczenie puli wyboru do K najbardziej prawdopodobnych tokenów w każdym kroku.
-    # - Działanie: Przy top_k = 40 model w każdym kroku odrzuca wszystkie słowa poza 40 najlepszymi kandydatami.
-    #   Zmniejsza szansę na wygenerowanie błędów składniowych.
-    # - Performance: Minimalnie przyspiesza próbkowanie na CPU/GPU.
     "top_k": 40,
-
-    # repeat_penalty: Kara za powtarzanie tych samych słów i fraz (1.0 = brak kary).
-    # - Działanie: Zapobiega zapętleniu się modelu (tzw. repetition loop, gdzie model w kółko powtarza jedno zdanie).
-    #   Uwaga: przy generowaniu kodu lub JSON z powtarzającymi się nazwami zmiennych (np. kp, ki, kd) nie należy
-    #   ustawiać zbyt wysoko (1.1 jest bezpieczne; powyżej 1.3 model zacznie unikać używania nazw zmiennych!).
-    "repeat_penalty": 1.1,
-
-    # num_gpu: Liczba warstw sieci neuronowej ładowanych na kartę graficzną.
-    # - Działanie / Performance: Wartość 99 (lub -1) wymusza załadowanie WSZYSTKICH warstw modelu na GPU.
-    #   Jeśli ustawisz 0, model będzie liczył wyłącznie na procesorze CPU (10x wolniej).
+    "repeat_penalty": 1.05,
     "num_gpu": 99,
-
-    # seed: Ziarno generatora liczb losowych.
-    # - Działanie: Ustawienie konkretnej liczby (np. 42) sprawia, że przy tej samej temperaturze model na to samo
-    #   pytanie odpowie zawsze identycznie (powtarzalność eksperymentów naukowych). -1 = losowe ziarno.
     "seed": 42
 }
-
-# Czas utrzymania modelu w pamięci VRAM po zakończeniu odpowiedzi:
-# "30m" = 30 minut, "-1" = trzymaj w VRAM bezterminowo (brak opóźnienia przy kolejnych pytaniach).
 KEEP_ALIVE = "30m"
 
+# ==============================================================================
+# 3. SCHEMAT SEMANTYCZNY (ZERO ZNAKÓW +/- I ARYTMETYKI PO STRONIE LLM)
+# ==============================================================================
 JSON_SCHEMA = {
     "type": "object",
     "properties": {
-        "odpowiedz_dla_uzytkownika": {"type": "string"},
-        "mode": {"type": "string", "enum": ["velocity", "position"]},
-        "hold_current": {"type": "boolean"},
-        "target_x": {"type": "number"},
-        "target_y": {"type": "number"},
-        "target_z": {"type": "number"},
-        "target_roll": {"type": "number"},
-        "target_pitch": {"type": "number"},
-        "target_vz": {"type": "number"},
-        "target_yaw_rate": {"type": "number"},
+        "odpowiedz": {"type": "string"},
+        "action": {
+            "type": "string",
+            "enum": ["set_altitude", "goto_point", "move_relative", "velocity", "land", "stop"]
+        },
+        "przod_tyl": {"type": "string", "enum": ["brak", "przod", "tyl"]},
+        "lewo_prawo": {"type": "string", "enum": ["brak", "lewo", "prawo"]},
+        "gora_dol": {"type": "string", "enum": ["brak", "gora", "dol"]},
+        "obrot": {"type": "string", "enum": ["brak", "lewo", "prawo"]},
+        "dystans_przod_tyl": {"type": "number"},
+        "dystans_lewo_prawo": {"type": "number"},
+        "dystans_gora_dol": {"type": "number"},
+        "dystans_skos": {"type": "number"},
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "z": {"type": "number"},
+        "predkosc": {"type": "string", "enum": ["powoli", "normalnie", "szybko"]},
         "duration_sec": {"type": "number"}
     },
     "required": [
-        "odpowiedz_dla_uzytkownika", "mode", "hold_current",
-        "target_x", "target_y", "target_z",
-        "target_roll", "target_pitch", "target_vz", "target_yaw_rate", "duration_sec"
+        "odpowiedz", "action",
+        "przod_tyl", "lewo_prawo", "gora_dol", "obrot",
+        "dystans_przod_tyl", "dystans_lewo_prawo", "dystans_gora_dol", "dystans_skos",
+        "x", "y", "z", "predkosc", "duration_sec"
     ]
 }
 
-COMMAND_LEGEND_JSON = {
-    "mode": "'position' (utrzymanie punktu lub lot na współrzędne X,Y,Z) lub 'velocity' (lot kierunkowy przez czas)",
-    "hold_current": "true = zatrzymaj się i trzymaj bieżący punkt (zatrzymaj się/zawiśnij/włącz pozycję); false = leć do target_x,y,z",
-    "osie_velocity": "lewo=-roll, prawo=+roll, przód=+pitch, tył=-pitch, góra=+vz, dół=-vz",
-    "predkosci": "powoli=0.05 (vz 0.2), zwykle=0.15 (vz 0.5), szybko=0.3 (vz 1.0); brak czasu -> duration_sec=2.0",
-    "regula_zerowania": "niewymienione pola ruchu ustaw na 0.0; przy locie w trybie position ustaw pola velocity na 0.0"
+# Krótka przypominajka doklejana do każdej wiadomości (zapobiega degradacji z czasem)
+REMINDER_JSON = {
+    "akcje": {
+        "set_altitude": "docelowa wysokość nad ziemią (np. 'na 9 m') -> ustaw z",
+        "goto_point": "konkretne współrzędne punktu (np. 'punkt 0 0 3') -> ustaw x, y, z",
+        "move_relative": "przesunięcie o podaną liczbę metrów -> ustaw kierunki + nieujemne dystanse (dla łącznego dystansu po skosie wpisz dystans_skos)",
+        "velocity": "lot/obrót na czas lub bez podanych metrów -> ustaw kierunki, predkosc i duration_sec (domyślnie 2.0)",
+        "land": "wyląduj",
+        "stop": "zatrzymaj się / utrzymaj pozycję / zawiśnij"
+    },
+    "wazne": "Kierunki wybieraj słownie (przod/tyl, lewo/prawo, gora/dol). Dystanse ZAWSZE dodatnie. Niewykorzystane kierunki='brak', liczby=0.0."
 }
 
-DEFAULT_SYSTEM_PROMPT = """Jesteś asystentem sterowania dronem X3 w ROS 2.
-W każdej wiadomości otrzymujesz obiekt JSON ze stanem drona, legendą komend oraz poleceniem operatora.
-Zwracaj WYŁĄCZNIE poprawny JSON zgodny ze schematem:
-- Jeśli użytkownik prosi o zatrzymanie, zawis w punkcie, włączenie pozycjonowania lub lot do konkretnych współrzędnych [X, Y, Z], wybierz mode='position'.
-- Jeśli użytkownik prosi o ruch kierunkowy (np. w przód, w lewo, na skos, w górę przez N sekund), wybierz mode='velocity' (po czasie dron sam zakotwiczy pozycję)."""
+SYSTEM_PROMPT = """Jesteś tłumaczem poleceń operatora drona X3 na strukturę JSON.
+NIE przeliczasz współrzędnych ani znaków +/- — wybierz wyłącznie właściwą akcję, słowne kierunki i dodatnie wartości.
+W polu "odpowiedz" napisz krótko po polsku, jaki dokładnie manewr wykonujesz (nie powtarzaj szablonu "Zrozumiałem polecenie").
 
-
-def load_or_create_system_prompt(filepath: str) -> str:
-    if os.path.exists(filepath):
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f).get("system_prompt", DEFAULT_SYSTEM_PROMPT)
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump({"system_prompt": DEFAULT_SYSTEM_PROMPT}, f, ensure_ascii=False, indent=2)
-    return DEFAULT_SYSTEM_PROMPT
+PRZYKŁADY (niewymienione kierunki="brak", liczby=0.0, predkosc="normalnie"):
+- "leć do góry na 9 metrów" -> {"odpowiedz":"Wznoszę się na wysokość 9 m.", "action":"set_altitude", "z":9.0}
+- "poleć 8 metrów do góry" -> {"odpowiedz":"Lecę 8 m w górę.", "action":"move_relative", "gora_dol":"gora", "dystans_gora_dol":8.0}
+- "poleć po skosie w lewo w przód 7 metrów" -> {"odpowiedz":"Lecę 7 m po skosie w przód i w lewo.", "action":"move_relative", "przod_tyl":"przod", "lewo_prawo":"lewo", "dystans_skos":7.0}
+- "poleć po skosie w prawo w przód 5 metrów" -> {"odpowiedz":"Lecę 5 m po skosie w przód i w prawo.", "action":"move_relative", "przod_tyl":"przod", "lewo_prawo":"prawo", "dystans_skos":5.0}
+- "poleć do przodu 3 metry i w lewo 2 metry" -> {"odpowiedz":"Lecę 3 m do przodu i 2 m w lewo.", "action":"move_relative", "przod_tyl":"przod", "lewo_prawo":"lewo", "dystans_przod_tyl":3.0, "dystans_lewo_prawo":2.0}
+- "poleć w prawo 2 metry" -> {"odpowiedz":"Przesuwam się 2 m w prawo.", "action":"move_relative", "lewo_prawo":"prawo", "dystans_lewo_prawo":2.0}
+- "poleć po skosie w prawo w przód przez 4 sekundy" -> {"odpowiedz":"Lecę po skosie w przód i w prawo przez 4 s.", "action":"velocity", "przod_tyl":"przod", "lewo_prawo":"prawo", "predkosc":"normalnie", "duration_sec":4.0}
+- "poleć do góry przez 5 sekund szybko" -> {"odpowiedz":"Lecę szybko w górę przez 5 s.", "action":"velocity", "gora_dol":"gora", "predkosc":"szybko", "duration_sec":5.0}
+- "poleć do punktu 0.0 0.0 3.0" -> {"odpowiedz":"Lecę do punktu (0, 0, 3).", "action":"goto_point", "x":0.0, "y":0.0, "z":3.0}
+- "utrzymaj pozycję" -> {"odpowiedz":"Zatrzymuję się i utrzymuję bieżącą pozycję.", "action":"stop"}
+- "wyląduj" -> {"odpowiedz":"Rozpoczynam lądowanie.", "action":"land"}"""
 
 
 def clean_json_response(raw_text: str) -> dict:
     text = raw_text.strip()
-    if text.startswith("```json"): text = text[7:]
-    if text.startswith("```"): text = text[3:]
-    if text.endswith("```"): text = text[:-3]
-    return json.loads(text.strip())
+    if "</think>" in text:
+        text = text.split("</think>", 1)[-1].strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1:
+        text = text[start:end + 1]
+    return json.loads(text)
 
 
 def estimate_true_history_tokens(chat_history: list) -> int:
@@ -140,11 +121,113 @@ def get_drone_state() -> dict:
         return {"mode": "nieznany", "position": {"x": 0.0, "y": 0.0, "z": 0.0}}
 
 
+def build_ros_command(llm_json: dict, drone_state: dict) -> dict:
+    """Deterministycznie tłumaczy słowną intencję LLM na znaki ROS 2 (FLU: +X przód, +Y lewo, +Z góra)."""
+    pos = drone_state.get("position", {"x": 0.0, "y": 0.0, "z": 0.0})
+    cx = float(pos.get("x", 0.0))
+    cy = float(pos.get("y", 0.0))
+    cz = float(pos.get("z", 0.0))
+
+    action = str(llm_json.get("action", "stop")).lower()
+
+    # Mapowanie kierunków słownych na znaki osi FLU (+X przód, +Y lewo, +Z góra)
+    fb = str(llm_json.get("przod_tyl", "brak")).lower()
+    lr = str(llm_json.get("lewo_prawo", "brak")).lower()
+    ud = str(llm_json.get("gora_dol", "brak")).lower()
+    rot = str(llm_json.get("obrot", "brak")).lower()
+
+    sx = 1.0 if fb == "przod" else (-1.0 if fb == "tyl" else 0.0)
+    sy = 1.0 if lr == "lewo" else (-1.0 if lr == "prawo" else 0.0)
+    sz = 1.0 if ud == "gora" else (-1.0 if ud == "dol" else 0.0)
+    syaw = 1.0 if rot == "lewo" else (-1.0 if rot == "prawo" else 0.0)
+
+    if action == "set_altitude":
+        z_val = float(llm_json.get("z", 0.0))
+        if z_val <= 0.0:
+            z_val = abs(float(llm_json.get("dystans_gora_dol", cz)))
+        return {"mode": "position", "target_x": cx, "target_y": cy, "target_z": round(max(0.0, z_val), 2)}
+
+    if action == "goto_point":
+        tx = round(float(llm_json.get("x", cx)), 2)
+        ty = round(float(llm_json.get("y", cy)), 2)
+        tz = round(max(0.0, float(llm_json.get("z", cz))), 2)
+        return {"mode": "position", "target_x": tx, "target_y": ty, "target_z": tz}
+
+    if action == "move_relative":
+        d_fb = abs(float(llm_json.get("dystans_przod_tyl", 0.0)))
+        d_lr = abs(float(llm_json.get("dystans_lewo_prawo", 0.0)))
+        d_ud = abs(float(llm_json.get("dystans_gora_dol", 0.0)))
+        d_diag = abs(float(llm_json.get("dystans_skos", 0.0)))
+
+        active_axes = int(sx != 0.0) + int(sy != 0.0) + int(sz != 0.0)
+        dx = dy = dz = 0.0
+
+        if d_diag > 0.0 and active_axes > 0:
+            norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+            dx = (sx / norm) * d_diag
+            dy = (sy / norm) * d_diag
+            dz = (sz / norm) * d_diag
+        elif active_axes >= 2:
+            # Zabezpieczenie: jeśli przy skosie model wpisał dystans w tylko jedno pole zamiast dystans_skos
+            nonzero_active = [d for s, d in ((sx, d_fb), (sy, d_lr), (sz, d_ud)) if s != 0.0 and d > 0.0]
+            if len(nonzero_active) == 1:
+                norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+                dx = (sx / norm) * nonzero_active[0]
+                dy = (sy / norm) * nonzero_active[0]
+                dz = (sz / norm) * nonzero_active[0]
+            else:
+                dx = sx * d_fb
+                dy = sy * d_lr
+                dz = sz * d_ud
+        elif active_axes == 1:
+            d_single = d_fb or d_lr or d_ud or d_diag
+            dx = sx * d_single
+            dy = sy * d_single
+            dz = sz * d_single
+
+        tx = round(cx + dx, 2)
+        ty = round(cy + dy, 2)
+        min_safe_z = 0.5 if cz >= 0.5 else cz
+        tz = round(max(min_safe_z, cz + dz), 2) if dz < 0.0 else round(max(0.0, cz + dz), 2)
+        return {"mode": "position", "target_x": tx, "target_y": ty, "target_z": tz}
+
+    if action == "land":
+        return {"mode": "position", "target_x": cx, "target_y": cy, "target_z": 0.0}
+
+    if action == "stop":
+        return {"mode": "position", "target_x": cx, "target_y": cy, "target_z": cz}
+
+    # Domyślnie: action == "velocity"
+    speed = str(llm_json.get("predkosc", "normalnie")).lower()
+    tilt_val = {"powoli": 0.05, "normalnie": 0.15, "szybko": 0.25}.get(speed, 0.15)
+    vz_val = {"powoli": 0.2, "normalnie": 0.5, "szybko": 1.0}.get(speed, 0.5)
+    yaw_val = {"powoli": 0.3, "normalnie": 0.6, "szybko": 1.0}.get(speed, 0.6)
+
+    # Uwaga na konwencję Roll: lewo (sy=+1) to ujemny Roll (-tilt), prawo (sy=-1) to dodatni Roll (+tilt)
+    pitch = sx * tilt_val
+    roll = -sy * tilt_val
+    vz = sz * vz_val
+    yaw_rate = syaw * yaw_val
+
+    duration = float(llm_json.get("duration_sec", 2.0))
+    if duration <= 0.0:
+        duration = 2.0
+
+    return {
+        "mode": "velocity",
+        "target_roll": round(roll, 3),
+        "target_pitch": round(pitch, 3),
+        "target_vz": round(vz, 3),
+        "target_yaw_rate": round(yaw_rate, 3),
+        "duration_sec": round(duration, 2)
+    }
+
+
 def send_message_to_llm(chat_history: list, current_user_input: str, drone_state: dict):
     wrapped_user_msg = json.dumps({
         "stan_drona": drone_state,
-        "legenda_komend": COMMAND_LEGEND_JSON,
-        "polecenie_uzytkownika": current_user_input
+        "przypomnienie": REMINDER_JSON,
+        "polecenie": current_user_input
     }, ensure_ascii=False)
 
     messages_for_api = chat_history + [{"role": "user", "content": wrapped_user_msg}]
@@ -153,13 +236,16 @@ def send_message_to_llm(chat_history: list, current_user_input: str, drone_state
         "model": MODEL_NAME,
         "messages": messages_for_api,
         "stream": False,
+        "think": False,
         "options": MODEL_OPTIONS,
         "keep_alive": KEEP_ALIVE,
         "format": JSON_SCHEMA
     }
     response = requests.post(OLLAMA_URL, json=payload, timeout=60)
     response.raise_for_status()
-    return clean_json_response(response.json()["message"]["content"]), response.json()
+    data = response.json()
+    raw_content = data.get("message", {}).get("content", "")
+    return clean_json_response(raw_content), data
 
 
 def send_command_to_laptop(command_json: dict):
@@ -171,10 +257,9 @@ def send_command_to_laptop(command_json: dict):
 
 
 def main():
-    system_prompt = load_or_create_system_prompt(CONTEXT_FILE)
-    chat_history = [{"role": "system", "content": system_prompt}]
+    chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    print(f"--- AI DRONE CHAT ({MODEL_NAME}) | Komendy: /pos on, /pos off, /reset, /wyjdz ---")
+    print(f"--- AI DRONE CHAT ({MODEL_NAME}) | Komendy: /reset, /wyjdz ---")
 
     while True:
         try:
@@ -182,48 +267,61 @@ def main():
         except (KeyboardInterrupt, EOFError):
             break
 
-        if not user_input: continue
-        if user_input.lower() in ["/wyjdz", "exit", "quit"]: break
+        if not user_input:
+            continue
+        if user_input.lower() in ["/wyjdz", "exit", "quit"]:
+            break
         if user_input.lower() == "/reset":
-            chat_history = [{"role": "system", "content": system_prompt}]
+            chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
             print(" -> [INFO]: Pamięć wyczyszczona.")
             continue
 
-        if user_input.lower() == "/pos on":
-            send_command_to_laptop({"mode": "position", "hold_current": True})
-            continue
-        if user_input.lower() == "/pos off":
-            send_command_to_laptop({
-                "mode": "velocity", "target_roll": 0.0, "target_pitch": 0.0,
-                "target_vz": 0.0, "target_yaw_rate": 0.0, "duration_sec": 0.0, "auto_hold_after": False
-            })
-            continue
-
         drone_state = get_drone_state()
+        diag_data = {}
 
         try:
-            command_json, diag_data = send_message_to_llm(chat_history, user_input, drone_state)
+            llm_json, diag_data = send_message_to_llm(chat_history, user_input, drone_state)
+            ros_cmd = build_ros_command(llm_json, drone_state)
 
             chat_history.append({"role": "user", "content": user_input})
-            chat_history.append({"role": "assistant", "content": json.dumps(command_json, ensure_ascii=False)})
+            chat_history.append({"role": "assistant", "content": json.dumps(llm_json, ensure_ascii=False)})
+            if len(chat_history) > 1 + MAX_HISTORY_TURNS * 2:
+                chat_history = [chat_history[0]] + chat_history[-(MAX_HISTORY_TURNS * 2):]
 
-            print(f"AI: {command_json.get('odpowiedz_dla_uzytkownika')}")
-            if command_json.get("mode") == "position":
-                print(f" -> [POS]: hold={command_json.get('hold_current')} | "
-                      f"X={command_json.get('target_x')} Y={command_json.get('target_y')} Z={command_json.get('target_z')}")
+            print(f"AI: {llm_json.get('odpowiedz')}")
+            print(
+                f" -> [INTENCJA]: action={llm_json.get('action')} | "
+                f"FB={llm_json.get('przod_tyl')} LR={llm_json.get('lewo_prawo')} "
+                f"UD={llm_json.get('gora_dol')} ROT={llm_json.get('obrot')}"
+            )
+
+            if ros_cmd["mode"] == "position":
+                print(
+                    f" -> [POS]: X={ros_cmd['target_x']} "
+                    f"Y={ros_cmd['target_y']} Z={ros_cmd['target_z']}"
+                )
             else:
-                print(f" -> [VEL]: R={command_json.get('target_roll')} P={command_json.get('target_pitch')} "
-                      f"Vz={command_json.get('target_vz')} t={command_json.get('duration_sec')}s")
+                print(
+                    f" -> [VEL]: R={ros_cmd['target_roll']} P={ros_cmd['target_pitch']} "
+                    f"Vz={ros_cmd['target_vz']} Yaw={ros_cmd['target_yaw_rate']} "
+                    f"t={ros_cmd['duration_sec']}s"
+                )
 
-            send_command_to_laptop(command_json)
+            send_command_to_laptop(ros_cmd)
 
             tokens_per_sec = diag_data.get("eval_count", 0) / (diag_data.get("eval_duration", 1) / 1e9)
             true_tok = estimate_true_history_tokens(chat_history)
             ctx_pct = (true_tok / MODEL_OPTIONS["num_ctx"]) * 100
-            print(f" -> [DIAG]: {len(chat_history)} wiad. | Pamięć: ~{true_tok}/{MODEL_OPTIONS['num_ctx']} ({ctx_pct:.1f}%) | {tokens_per_sec:.1f} tok/s")
+            print(
+                f" -> [DIAG]: {len(chat_history)} wiad. | "
+                f"Pamięć: ~{true_tok}/{MODEL_OPTIONS['num_ctx']} ({ctx_pct:.1f}%) | "
+                f"{tokens_per_sec:.1f} tok/s"
+            )
 
-        except json.JSONDecodeError:
-            print(" -> [BŁĄD]: Niepoprawny JSON.")
+        except json.JSONDecodeError as e:
+            raw = diag_data.get("message", {}).get("content", "")
+            reason = diag_data.get("done_reason", "nieznany")
+            print(f" -> [BŁĄD]: Niepoprawny JSON ({e}) | done_reason={reason} | raw={raw[:180]!r}")
         except requests.exceptions.RequestException as e:
             print(f" -> [BŁĄD OLLAMA]: {e}")
 
