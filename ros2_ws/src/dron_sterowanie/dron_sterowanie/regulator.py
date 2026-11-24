@@ -12,16 +12,16 @@ from dron_sterowanie.math_utils import euler_from_quaternion
 
 class AttitudeControllerNode(Node):
     """
-    Kaskadowy sterownik drona X3 obsługujący dwa tryby pracy:
-    1. Tryb prędkościowo-kątowy (use_pos_pid=False): zadawane target_roll, target_pitch, target_vz, target_yaw_rate.
-    2. Tryb pozycyjny (use_pos_pid=True): nadrzędna pętla (pid_x, pid_y, pid_z) w układzie świata +
-       transformacja przez kąt Yaw na zadane kąty Pitch i Roll dla pętli podrzędnej.
+    Kaskadowy sterownik drona X3:
+    - Pętla nadrzędna (X, Y, Z) w układzie świata + transformacja przez kąt Yaw na zadane kąty Pitch/Roll.
+    - Pętla podrzędna (Roll, Pitch, Yaw Rate) + Mikser X z desaturacją (priorytet orientacji).
     """
     def __init__(self):
         super().__init__('regulator_node')
 
         self.max_motor_speed = 800.0
         self.min_motor_speed = 0.0
+        self.max_tilt = 0.35  # ok. 20 stopni
 
         # Bieżąca pozycja drona z odometrii oraz zatrzaskiwany pułap
         self.current_x = None
@@ -36,8 +36,8 @@ class AttitudeControllerNode(Node):
         self.pid_z = PID(75.0, 8.0, 65.0, out_limit=120.0, i_limit=40.0)
 
         # Pętla nadrzędna (pozycja XY w układzie świata -> wirtualne sterowanie przed obrotem)
-        self.pid_x = PID(0.35, 0.02, 0.25, out_limit=0.25, i_limit=0.10)
-        self.pid_y = PID(0.35, 0.02, 0.25, out_limit=0.25, i_limit=0.10)
+        self.pid_x = PID(0.12, 0.0, 0.05, out_limit=self.max_tilt, i_limit=0.10)
+        self.pid_y = PID(0.12, 0.0, 0.05, out_limit=self.max_tilt, i_limit=0.10)
 
         default_parameters = [
             ('use_rp_pid', True), ('use_yaw_pid', True), ('use_z_pid', True),
@@ -48,7 +48,7 @@ class AttitudeControllerNode(Node):
             ('kp_rp', 110.0), ('ki_rp', 5.0), ('kd_rp', 28.0),
             ('kp_yaw', 180.0), ('ki_yaw', 0.0), ('kd_yaw', 5.0),
             ('kp_z', 75.0), ('ki_z', 8.0), ('kd_z', 65.0),
-            ('kp_xy', 0.35), ('ki_xy', 0.02), ('kd_xy', 0.25),
+            ('kp_xy', 0.12), ('ki_xy', 0.0), ('kd_xy', 0.05),
         ]
         self.declare_parameters(namespace='', parameters=default_parameters)
         self._read_initial_parameters()
@@ -60,7 +60,7 @@ class AttitudeControllerNode(Node):
         self.odom_sub = self.create_subscription(Odometry, '/model/X3/odometry', self.odom_callback, 10)
         self.motor_pub = self.create_publisher(Actuators, '/X3/command/motor_speed', 10)
 
-        self.get_logger().info('Kaskadowy sterownik drona (Attitude + Position) uruchomiony!')
+        self.get_logger().info('Kaskadowy sterownik drona (Attitude + Position + Desaturacja) uruchomiony!')
 
     def _read_initial_parameters(self):
         self.use_rp_pid = bool(self.get_parameter('use_rp_pid').value)
@@ -106,7 +106,6 @@ class AttitudeControllerNode(Node):
                     self.pid_x.reset()
                     self.pid_y.reset()
 
-                # Zatrzaskujemy współrzędne zawsze, gdy nie podano ich jawnie (działa też jako "stop" w locie)
                 if 'target_x' not in param_map and self.current_x is not None:
                     self.target_x = self.current_x
                 if 'target_y' not in param_map and self.current_y is not None:
@@ -234,24 +233,22 @@ class AttitudeControllerNode(Node):
         # ------------------- 2. PĘTLA NADRZĘDNA POZYCJI XY (KASKADA) -------------------
         if self.use_pos_pid and u_z > 0.0:
             if pos.z > 0.35:
-                # 1. Uchyb i PID w układzie świata [m -> wirtualne sterowanie u_x, u_y]
+                # 1. Uchyb i PID w układzie świata
                 e_x_world = self.target_x - pos.x
                 e_y_world = self.target_y - pos.y
                 u_x = self.pid_x.compute(e_x_world, dt)
                 u_y = self.pid_y.compute(e_y_world, dt)
 
-                # 2. Transformacja do układu lokalnego drona (obrót o kąt Yaw + konwencja znaku Roll)
+                # 2. Transformacja do układu lokalnego drona (obrót o Yaw + znak Roll)
                 cos_y = math.cos(yaw)
                 sin_y = math.sin(yaw)
                 raw_pitch = u_x * cos_y + u_y * sin_y
                 raw_roll = u_x * sin_y - u_y * cos_y
 
-                # 3. Twardy limit końcowych kątów zadanych po obrocie [rad]
-                max_tilt = 0.25
-                eff_target_pitch = max(-max_tilt, min(max_tilt, raw_pitch))
-                eff_target_roll = max(-max_tilt, min(max_tilt, raw_roll))
+                # 3. Limit końcowych kątów zadanych po obrocie [rad]
+                eff_target_pitch = max(-self.max_tilt, min(self.max_tilt, raw_pitch))
+                eff_target_roll = max(-self.max_tilt, min(self.max_tilt, raw_roll))
             else:
-                # Podczas odrywania się od ziemi startujemy pionowo, bez przechyłu
                 self.pid_x.reset()
                 self.pid_y.reset()
                 eff_target_pitch = 0.0
@@ -278,15 +275,28 @@ class AttitudeControllerNode(Node):
             self.pid_yaw_rate.reset()
             u_psi = 0.0
 
-        # ------------------- 5. MIKSER KINEMATYCZNY (UKŁAD X) -------------------
+        # ------------------- 5. MIKSER X + DESATURACJA (PRIORYTET ORIENTACJI) -------------------
         if u_z <= 0.0:
             speeds = [0.0, 0.0, 0.0, 0.0]
         else:
-            w1 = u_z - u_phi - u_theta - u_psi
-            w2 = u_z + u_phi + u_theta - u_psi
-            w3 = u_z + u_phi - u_theta + u_psi
-            w4 = u_z - u_phi + u_theta + u_psi
-            speeds = [float(max(self.min_motor_speed, min(self.max_motor_speed, w))) for w in (w1, w2, w3, w4)]
+            raw_speeds = [
+                u_z - u_phi - u_theta - u_psi,
+                u_z + u_phi + u_theta - u_psi,
+                u_z + u_phi - u_theta + u_psi,
+                u_z - u_phi + u_theta + u_psi,
+            ]
+            # Jeśli silniki wychodzą poza [0, 800], przesuwamy ciąg wspólny u_z,
+            # zachowując w 100% różnicowe momenty Roll, Pitch i Yaw
+            max_w = max(raw_speeds)
+            min_w = min(raw_speeds)
+            if max_w > self.max_motor_speed:
+                shift = max_w - self.max_motor_speed
+                raw_speeds = [w - shift for w in raw_speeds]
+            elif min_w < self.min_motor_speed:
+                shift = self.min_motor_speed - min_w
+                raw_speeds = [w + shift for w in raw_speeds]
+
+            speeds = [float(max(self.min_motor_speed, min(self.max_motor_speed, w))) for w in raw_speeds]
 
         out_msg = Actuators()
         out_msg.velocity = speeds

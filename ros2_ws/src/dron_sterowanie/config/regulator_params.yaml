@@ -34,6 +34,6 @@ regulator_node:
     ki_z: 8.0
     kd_z: 65.0
 
-    kp_xy: 0.35
-    ki_xy: 0.02
-    kd_xy: 0.25
+    kp_xy: 0.12
+    ki_xy: 0.0
+    kd_xy: 0.05
